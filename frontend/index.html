@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SlideShift</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f5f5f7;
+      color: #1d1d1f;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+
+    .card {
+      background: #fff;
+      border-radius: 18px;
+      padding: 48px 40px;
+      max-width: 520px;
+      width: 100%;
+      box-shadow: 0 2px 24px rgba(0,0,0,0.08);
+    }
+
+    h1 {
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: -0.3px;
+      margin-bottom: 4px;
+    }
+
+    .subtitle {
+      font-size: 14px;
+      color: #6e6e73;
+      margin-bottom: 36px;
+    }
+
+    .upload-group {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      margin-bottom: 28px;
+    }
+
+    .upload-box {
+      border: 2px dashed #d2d2d7;
+      border-radius: 12px;
+      padding: 20px 18px;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+      position: relative;
+    }
+
+    .upload-box:hover, .upload-box.drag-over {
+      border-color: #0071e3;
+      background: #f0f6ff;
+    }
+
+    .upload-box.has-file {
+      border-color: #34c759;
+      background: #f0faf3;
+    }
+
+    .upload-box input[type=file] {
+      position: absolute;
+      inset: 0;
+      opacity: 0;
+      cursor: pointer;
+      width: 100%;
+      height: 100%;
+    }
+
+    .upload-label {
+      font-size: 13px;
+      font-weight: 600;
+      color: #6e6e73;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 4px;
+    }
+
+    .upload-name {
+      font-size: 15px;
+      font-weight: 500;
+      color: #1d1d1f;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .upload-hint {
+      font-size: 13px;
+      color: #aeaeb2;
+    }
+
+    .upload-icon {
+      font-size: 24px;
+      margin-bottom: 6px;
+    }
+
+    button#transferBtn {
+      width: 100%;
+      padding: 14px;
+      background: #0071e3;
+      color: #fff;
+      font-size: 16px;
+      font-weight: 600;
+      border: none;
+      border-radius: 12px;
+      cursor: pointer;
+      transition: background 0.2s, opacity 0.2s;
+    }
+
+    button#transferBtn:hover:not(:disabled) { background: #0077ed; }
+    button#transferBtn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* Progress */
+    .progress-section {
+      display: none;
+      margin-top: 24px;
+    }
+
+    .progress-steps {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .step {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 14px;
+      color: #aeaeb2;
+      transition: color 0.3s;
+    }
+
+    .step.active { color: #0071e3; font-weight: 500; }
+    .step.done { color: #34c759; }
+
+    .step-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: #d2d2d7;
+      flex-shrink: 0;
+      transition: background 0.3s;
+    }
+
+    .step.active .step-dot { background: #0071e3; }
+    .step.done .step-dot { background: #34c759; }
+
+    /* Result */
+    .result-section {
+      display: none;
+      margin-top: 24px;
+      border-top: 1px solid #f0f0f5;
+      padding-top: 24px;
+    }
+
+    .result-title {
+      font-size: 18px;
+      font-weight: 700;
+      margin-bottom: 12px;
+    }
+
+    .result-title.success { color: #34c759; }
+    .result-title.warn { color: #ff9f0a; }
+    .result-title.error { color: #ff3b30; }
+
+    .stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .stat {
+      background: #f5f5f7;
+      border-radius: 10px;
+      padding: 10px 12px;
+      text-align: center;
+    }
+
+    .stat-val {
+      font-size: 22px;
+      font-weight: 700;
+    }
+
+    .stat-label {
+      font-size: 11px;
+      color: #6e6e73;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+    }
+
+    .warnings {
+      background: #fff9f0;
+      border: 1px solid #ffd60a;
+      border-radius: 10px;
+      padding: 12px 14px;
+      font-size: 13px;
+      color: #6e3a00;
+      margin-bottom: 16px;
+    }
+
+    .warnings ul { padding-left: 16px; margin-top: 6px; }
+    .warnings li { margin-bottom: 4px; }
+
+    .content-warnings {
+      margin-bottom: 16px;
+    }
+
+    .content-warnings-title {
+      font-size: 14px;
+      font-weight: 700;
+      color: #ff9f0a;
+      margin-bottom: 10px;
+    }
+
+    .cw-item {
+      background: #fff9f0;
+      border: 1px solid #ffd60a;
+      border-radius: 10px;
+      padding: 10px 14px;
+      margin-bottom: 8px;
+    }
+
+    .cw-slide {
+      font-size: 13px;
+      font-weight: 700;
+      color: #1d1d1f;
+      margin-bottom: 2px;
+    }
+
+    .cw-msg {
+      font-size: 13px;
+      color: #6e3a00;
+    }
+
+    .download-btn {
+      display: block;
+      width: 100%;
+      padding: 14px;
+      background: #34c759;
+      color: #fff;
+      font-size: 16px;
+      font-weight: 600;
+      border: none;
+      border-radius: 12px;
+      cursor: pointer;
+      text-align: center;
+      text-decoration: none;
+      transition: background 0.2s;
+    }
+
+    .download-btn:hover { background: #30b352; }
+
+    .reset-btn {
+      margin-top: 12px;
+      display: block;
+      text-align: center;
+      font-size: 14px;
+      color: #0071e3;
+      cursor: pointer;
+      background: none;
+      border: none;
+      width: 100%;
+    }
+
+    .error-box {
+      background: #fff2f2;
+      border: 1px solid #ff3b30;
+      border-radius: 10px;
+      padding: 12px 14px;
+      font-size: 14px;
+      color: #8b0000;
+      margin-top: 16px;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+<div class="card">
+  <h1>SlideShift</h1>
+  <p class="subtitle">Move your content into the required PowerPoint template.</p>
+
+  <div class="upload-group">
+    <div class="upload-box" id="sourceBox">
+      <input type="file" id="sourceFile" accept=".pptx">
+      <div class="upload-icon">📄</div>
+      <div class="upload-label">Your Presentation</div>
+      <div class="upload-name" id="sourceName">Choose or drag a .pptx file</div>
+    </div>
+
+    <div class="upload-box" id="templateBox">
+      <input type="file" id="templateFile" accept=".pptx">
+      <div class="upload-icon">🎓</div>
+      <div class="upload-label">College Template</div>
+      <div class="upload-name" id="templateName">Choose or drag a .pptx file</div>
+    </div>
+  </div>
+
+  <button id="transferBtn" disabled>Transfer Content</button>
+
+  <div class="error-box" id="errorBox"></div>
+
+  <div class="progress-section" id="progressSection">
+    <ul class="progress-steps" id="progressSteps">
+      <li class="step" id="step-reading-source"><span class="step-dot"></span>Reading your presentation</li>
+      <li class="step" id="step-reading-template"><span class="step-dot"></span>Reading college template</li>
+      <li class="step" id="step-matching"><span class="step-dot"></span>Matching slide layouts</li>
+      <li class="step" id="step-transferring"><span class="step-dot"></span>Transferring content</li>
+      <li class="step" id="step-validating"><span class="step-dot"></span>Validating output</li>
+      <li class="step" id="step-creating"><span class="step-dot"></span>Creating PowerPoint file</li>
+    </ul>
+  </div>
+
+  <div class="result-section" id="resultSection">
+    <div class="result-title" id="resultTitle"></div>
+    <div class="stats" id="statsGrid"></div>
+    <div class="content-warnings" id="contentWarningsBox" style="display:none"></div>
+    <div class="warnings" id="warningsBox" style="display:none"></div>
+    <a class="download-btn" id="downloadBtn" href="#" download="Converted_Presentation.pptx">
+      ⬇ Download Converted Presentation
+    </a>
+    <button class="reset-btn" id="resetBtn">Start over</button>
+  </div>
+</div>
+
+<script>
+  const sourceFile = document.getElementById('sourceFile');
+  const templateFile = document.getElementById('templateFile');
+  const sourceBox = document.getElementById('sourceBox');
+  const templateBox = document.getElementById('templateBox');
+  const sourceName = document.getElementById('sourceName');
+  const templateName = document.getElementById('templateName');
+  const transferBtn = document.getElementById('transferBtn');
+  const progressSection = document.getElementById('progressSection');
+  const resultSection = document.getElementById('resultSection');
+  const errorBox = document.getElementById('errorBox');
+  const resetBtn = document.getElementById('resetBtn');
+
+  const STEPS = ['step-reading-source','step-reading-template','step-matching','step-transferring','step-validating','step-creating'];
+
+  function updateBtn() {
+    transferBtn.disabled = !(sourceFile.files[0] && templateFile.files[0]);
+  }
+
+  function setFileName(input, nameEl, box) {
+    const f = input.files[0];
+    if (f) {
+      nameEl.textContent = f.name;
+      box.classList.add('has-file');
+    } else {
+      nameEl.textContent = nameEl.dataset.placeholder || 'Choose or drag a .pptx file';
+      box.classList.remove('has-file');
+    }
+  }
+
+  sourceFile.addEventListener('change', () => { setFileName(sourceFile, sourceName, sourceBox); updateBtn(); });
+  templateFile.addEventListener('change', () => { setFileName(templateFile, templateName, templateBox); updateBtn(); });
+
+  // Drag-over visual
+  [sourceBox, templateBox].forEach(box => {
+    box.addEventListener('dragover', e => { e.preventDefault(); box.classList.add('drag-over'); });
+    box.addEventListener('dragleave', () => box.classList.remove('drag-over'));
+    box.addEventListener('drop', () => box.classList.remove('drag-over'));
+  });
+
+  function showStep(index) {
+    STEPS.forEach((id, i) => {
+      const el = document.getElementById(id);
+      if (i < index) { el.className = 'step done'; }
+      else if (i === index) { el.className = 'step active'; }
+      else { el.className = 'step'; }
+    });
+  }
+
+  function showError(msg) {
+    errorBox.textContent = msg;
+    errorBox.style.display = 'block';
+    transferBtn.disabled = false;
+    transferBtn.textContent = 'Transfer Content';
+    progressSection.style.display = 'none';
+  }
+
+  async function runTransfer() {
+    errorBox.style.display = 'none';
+    resultSection.style.display = 'none';
+    progressSection.style.display = 'block';
+    transferBtn.disabled = true;
+    transferBtn.textContent = 'Transferring…';
+
+    // Animate steps with delays to give visual feedback
+    const stepTimings = [0, 400, 800, 1200, 1600, 2000];
+    let stepTimer = 0;
+
+    function scheduleStep(i, delay) {
+      return setTimeout(() => showStep(i), delay);
+    }
+
+    const timers = stepTimings.map((t, i) => scheduleStep(i, t));
+
+    const formData = new FormData();
+    formData.append('source', sourceFile.files[0]);
+    formData.append('template', templateFile.files[0]);
+
+    let data;
+    try {
+      const res = await fetch('/api/transfer', { method: 'POST', body: formData });
+      timers.forEach(clearTimeout);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }));
+        showError(err.detail || 'Transfer failed. Please check your files and try again.');
+        return;
+      }
+      data = await res.json();
+    } catch (e) {
+      timers.forEach(clearTimeout);
+      showError('Could not connect to the server. Make sure the application is running.');
+      return;
+    }
+
+    // All steps done
+    STEPS.forEach(id => document.getElementById(id).className = 'step done');
+
+    // Show result
+    progressSection.style.display = 'none';
+    resultSection.style.display = 'block';
+
+    const hasWarnings = data.slides_requiring_review && data.slides_requiring_review.length > 0;
+    const titleEl = document.getElementById('resultTitle');
+    titleEl.textContent = hasWarnings
+      ? `⚠ Transfer completed with ${data.slides_requiring_review.length} slide(s) requiring review`
+      : '✓ Transfer Complete';
+    titleEl.className = 'result-title ' + (hasWarnings ? 'warn' : 'success');
+
+    const contentTransferred = data.slides_output - (data.slides_requiring_review ? data.slides_requiring_review.length : 0);
+    document.getElementById('statsGrid').innerHTML = `
+      <div class="stat"><div class="stat-val">${data.slides_processed}</div><div class="stat-label">Slides processed</div></div>
+      <div class="stat"><div class="stat-val">${data.slides_output}/${data.slides_processed}</div><div class="stat-label">Content transferred</div></div>
+      <div class="stat"><div class="stat-val">${data.slides_requiring_review ? data.slides_requiring_review.length : 0}</div><div class="stat-label">Require review</div></div>
+    `;
+
+    // Structured content warnings (unsupported shapes per slide)
+    const cwBox = document.getElementById('contentWarningsBox');
+    if (data.content_warnings && data.content_warnings.length > 0) {
+      cwBox.style.display = 'block';
+      const items = data.content_warnings.map(w =>
+        `<div class="cw-item"><div class="cw-slide">Slide ${w.slide}</div><div class="cw-msg">${w.message}</div></div>`
+      ).join('');
+      cwBox.innerHTML = '<div class="content-warnings-title">⚠ Slides requiring attention</div>' + items;
+    }
+
+    // Other warnings (overflow, empty slides, etc.) — exclude those already in content_warnings
+    const cwSlides = new Set((data.content_warnings || []).map(w => w.slide));
+    const otherWarnings = (data.warnings || []).filter(w => {
+      const m = w.match(/Slide (\d+)/);
+      return !m || !cwSlides.has(parseInt(m[1]));
+    });
+    if (otherWarnings.length > 0) {
+      const wb = document.getElementById('warningsBox');
+      wb.style.display = 'block';
+      wb.innerHTML = '<strong>Review needed:</strong><ul>' +
+        otherWarnings.map(w => `<li>${w}</li>`).join('') +
+        '</ul>';
+    }
+
+    document.getElementById('downloadBtn').href = data.download_url;
+    transferBtn.textContent = 'Transfer Content';
+  }
+
+  transferBtn.addEventListener('click', runTransfer);
+
+  resetBtn.addEventListener('click', () => {
+    sourceFile.value = '';
+    templateFile.value = '';
+    sourceName.textContent = 'Choose or drag a .pptx file';
+    templateName.textContent = 'Choose or drag a .pptx file';
+    sourceBox.classList.remove('has-file');
+    templateBox.classList.remove('has-file');
+    resultSection.style.display = 'none';
+    progressSection.style.display = 'none';
+    errorBox.style.display = 'none';
+    transferBtn.textContent = 'Transfer Content';
+    updateBtn();
+  });
+</script>
+</body>
+</html>
