@@ -120,6 +120,10 @@ def find_best_layout(slide_type: SlideType, layouts: list[TemplateLayout]) -> Te
     # Exact match first
     exact = [l for l in layouts if l.slide_type == slide_type]
     if exact:
+        if slide_type == SlideType.TITLE_ONLY:
+            # Prefer section-style layouts over the cover "Title Slide"
+            non_cover = [l for l in exact if "title slide" not in l.name.lower()]
+            return non_cover[0] if non_cover else exact[0]
         return exact[0]
 
     # Fallback chain

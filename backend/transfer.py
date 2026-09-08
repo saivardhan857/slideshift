@@ -26,6 +26,72 @@ from layout_matcher import TemplateLayout, SlideType, find_best_layout, analyze_
 
 
 OVERFLOW_THRESHOLD = 0.95  # flag slide if content uses >95% of placeholder height
+# ponytail: hardcoded for CUCOM template whose logo occupies ~0-1.88in in background image
+_TITLE_MIN_LEFT = Inches(2.0)
+
+_NS_A = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+_NS_P = 'http://schemas.openxmlformats.org/presentationml/2006/main'
+_NS_R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+
+
+def _extract_design_images(template_prs):
+    """Extract background picture shapes from a representative template content slide."""
+    ref_slide = None
+    for slide in template_prs.slides:
+        if 'title and content' in slide.slide_layout.name.lower():
+            ref_slide = slide
+            break
+    if ref_slide is None and template_prs.slides:
+        ref_slide = template_prs.slides[0]
+    if ref_slide is None:
+        return []
+
+    src_part = ref_slide.part
+    spTree = ref_slide.element.find(f'{{{_NS_P}}}cSld/{{{_NS_P}}}spTree')
+    if spTree is None:
+        return []
+
+    result = []
+    for child in spTree:
+        if child.tag.split('}')[-1] != 'pic':
+            continue
+        blip = child.find(f'.//{{{_NS_A}}}blip')
+        if blip is None:
+            continue
+        rId = blip.get(f'{{{_NS_R}}}embed')
+        if not rId:
+            continue
+        try:
+            blob = src_part.related_part(rId).blob
+        except Exception:
+            continue
+        xfrm = child.find(f'.//{{{_NS_A}}}xfrm')
+        if xfrm is None:
+            continue
+        off = xfrm.find(f'{{{_NS_A}}}off')
+        ext = xfrm.find(f'{{{_NS_A}}}ext')
+        if off is None or ext is None:
+            continue
+        result.append((blob, int(off.get('x', 0)), int(off.get('y', 0)),
+                       int(ext.get('cx', 0)), int(ext.get('cy', 0))))
+    return result
+
+
+def _add_background_images(dest_slide, design_images):
+    """Inject background images behind all slide content."""
+    spTree = dest_slide.element.find(f'{{{_NS_P}}}cSld/{{{_NS_P}}}spTree')
+    if spTree is None:
+        return
+    insert_idx = 2  # after nvGrpSpPr and grpSpPr
+    for blob, left, top, width, height in design_images:
+        try:
+            pic = dest_slide.shapes.add_picture(io.BytesIO(blob), left, top, width, height)
+            el = pic.element
+            spTree.remove(el)
+            spTree.insert(insert_idx, el)
+            insert_idx += 1
+        except Exception:
+            pass
 
 
 class TransferResult:
@@ -44,6 +110,8 @@ def _apply_run_formatting(dest_run, src_run: TextRun):
         dest_run.font.italic = src_run.italic
     if src_run.font_size is not None:
         dest_run.font.size = Pt(src_run.font_size)
+    if src_run.font_name:
+        dest_run.font.name = src_run.font_name
     if src_run.font_color:
         try:
             r = int(src_run.font_color[0:2], 16)
@@ -160,9 +228,12 @@ def transfer(
         if progress_callback:
             progress_callback(msg)
 
-    _progress("Reading template...")
+    _progress("reading_template")
     template_layouts = analyze_template(template_path)
     dest_prs = Presentation(template_path)
+
+    # Extract background design images before stripping template slides
+    design_images = _extract_design_images(dest_prs)
 
     # Remove all existing slides — must drop parts AND relationships to avoid
     # duplicate ZIP entries (which corrupt the output file)
@@ -179,9 +250,12 @@ def transfer(
         sldIdLst.remove(sldId)
 
     results = []
+    _progress("matching")
 
-    _progress("Transferring slides...")
-    for parsed in source_slides:
+    total_slides = len(source_slides)
+    for i, parsed in enumerate(source_slides):
+        if progress_callback:
+            progress_callback(f"slide:{i+1}/{total_slides}")
         result = TransferResult()
         result.slide_index = parsed.index
 
@@ -190,6 +264,7 @@ def transfer(
         best_layout = find_best_layout(slide_type, template_layouts)
         dest_layout = dest_prs.slide_layouts[best_layout.index]
         dest_slide = dest_prs.slides.add_slide(dest_layout)
+        _add_background_images(dest_slide, design_images)
 
         # Map placeholders by idx
         ph_map = {ph.placeholder_format.idx: ph for ph in dest_slide.placeholders}
@@ -197,6 +272,14 @@ def transfer(
         # --- Transfer title ---
         if parsed.title and 0 in ph_map:
             title_ph = ph_map[0]
+            if title_ph.left < _TITLE_MIN_LEFT:
+                orig_right = title_ph.left + title_ph.width
+                orig_top = title_ph.top       # read before xfrm override is created
+                orig_height = title_ph.height
+                title_ph.left = _TITLE_MIN_LEFT  # creates xfrm, zeros y
+                title_ph.top = orig_top          # restore y
+                title_ph.height = orig_height
+                title_ph.width = max(orig_right - _TITLE_MIN_LEFT, Inches(4))
             try:
                 _write_paragraphs_to_tf(title_ph.text_frame, parsed.title.paragraphs)
             except Exception as e:
@@ -314,7 +397,7 @@ def transfer(
 
         results.append(result)
 
-    _progress("Saving output...")
+    _progress("saving")
     dest_prs.save(output_path)
     _dedupe_pptx(output_path)
 

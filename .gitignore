@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.log
+.claude-flow/
+backend/saved_template.pptx
+backend/saved_template.json

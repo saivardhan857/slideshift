@@ -25,6 +25,7 @@ class TextRun:
     italic: Optional[bool] = None
     font_size: Optional[float] = None
     font_color: Optional[str] = None  # hex string
+    font_name: Optional[str] = None
 
 
 @dataclass
@@ -139,6 +140,7 @@ def _parse_text_frame(tf) -> list[Paragraph]:
                 italic=run.font.italic,
                 font_size=run.font.size.pt if run.font.size else None,
                 font_color=_parse_color(run.font.color) if run.font.color else None,
+                font_name=run.font.name,
             )
             runs.append(tr)
         if not runs and para.text:
@@ -275,10 +277,13 @@ def parse_source(path: str) -> list[ParsedSlide]:
                     else:
                         tb.is_body = True
                 else:
-                    # No placeholder — use vertical position heuristic
-                    # Top 20% of slide = title region
+                    # No placeholder — name beats position/length heuristics.
                     slide_height = prs.slide_height
-                    if shape.top < slide_height * 0.2:
+                    text = shape.text_frame.text.strip()
+                    name_is_title = shape.name.lower().startswith('title')
+                    if name_is_title:
+                        tb.is_title = True
+                    elif len(text) <= 100 and len(shape.text_frame.paragraphs) <= 2 and shape.top < slide_height * 0.2:
                         tb.is_title = True
                     else:
                         tb.is_body = True
