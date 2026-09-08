@@ -30,6 +30,30 @@ OVERFLOW_THRESHOLD = 0.95  # flag slide if content uses >95% of placeholder heig
 # ponytail: hardcoded for CUCOM template whose logo occupies ~0-1.88in in background image
 _TITLE_MIN_LEFT = Inches(2.0)
 
+# ponytail: measured from the CUCOM background image (8000x4500 full-bleed).
+# The saturated red wedge's left edge, within the body placeholder's vertical
+# span (y 2.0-6.76in), runs from ~9.30in at the top to ~11.1in mid-slide.
+# Clamp body text to the worst-case edge minus a ~0.2in margin so lecture text
+# never crosses the red. The wedge itself stays fully visible. Titles, images
+# and tables are not touched.  upgrade path: per-line diagonal clamp if the
+# uniform right edge ever wastes too much width on short slides.
+_BODY_SAFE_LEFT = Inches(0.92)    # CUCOM title/body left edge
+_BODY_SAFE_RIGHT = Inches(9.1)
+_COL_GUTTER = Inches(0.3)
+
+
+def _place_ph(ph, left, width):
+    """Reposition a placeholder while preserving its inherited top/height.
+
+    Setting .left/.width materialises an <a:xfrm> that would otherwise zero the
+    y-offset and height (same gotcha the title-repositioning code works around).
+    """
+    top, height = ph.top, ph.height
+    ph.left = left
+    ph.top = top
+    ph.height = height
+    ph.width = max(width, Inches(1.5))
+
 _NS_A = 'http://schemas.openxmlformats.org/drawingml/2006/main'
 _NS_P = 'http://schemas.openxmlformats.org/presentationml/2006/main'
 _NS_R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
@@ -314,14 +338,38 @@ def transfer(
             return merged
 
         def _fill_body(ph, paras):
-            """Write paragraphs into a body placeholder and let PowerPoint
-            shrink text to fit so nothing is clipped off-slide."""
+            """Write paragraphs into a body placeholder and enable PowerPoint
+            shrink-to-fit. For the rare box that is *badly* over-full even after
+            the width fix, bake a mild fontScale (>=0.75) so it also renders
+            correctly in non-PowerPoint viewers; mildly-full boxes are left for
+            PowerPoint's own autofit so their font size is untouched."""
             _write_paragraphs_to_tf(ph.text_frame, paras)
+            tf = ph.text_frame
             try:
-                ph.text_frame.word_wrap = True
-                ph.text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+                tf.word_wrap = True
+                tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
             except Exception:
-                pass
+                return
+            box_w_in = max(ph.width / 914400.0, 1.0)
+            box_h_in = max(ph.height / 914400.0, 1.0)
+            need_in = 0.0
+            for para in paras:
+                txt = para.full_text
+                if not txt.strip():
+                    need_in += 18.0 * 1.15 / 72.0  # blank separator line
+                    continue
+                sizes = [r.font_size for r in para.runs if r.font_size]
+                pt = min(sizes) if sizes else 18.0
+                cpl = max(8, int(box_w_in / (0.46 * pt / 72.0)))  # ~0.46em avg glyph
+                lines = max(1, -(-len(txt) // cpl))
+                need_in += lines * (pt * 1.15 / 72.0)
+            # Only intervene when clearly over-full; PowerPoint handles the rest.
+            if need_in > box_h_in * 1.15:
+                scale = max(0.75, box_h_in / need_in)
+                na = tf._txBody.find(f'.//{{{_NS_A}}}bodyPr/{{{_NS_A}}}normAutofit')
+                if na is not None:
+                    na.set('fontScale', str(int(round(scale * 100000))))
+                    na.set('lnSpcReduction', '10000')
 
         if body_text_boxes and 1 in ph_map:
             try:
@@ -329,12 +377,26 @@ def transfer(
                 # placeholder → spread the boxes across both columns instead of
                 # stacking them all in the (often half-width) first one.
                 if len(body_text_boxes) >= 2 and 2 in ph_map:
+                    # BUG-2: if either column reaches into the red wedge, rebalance
+                    # both into the text-safe band (0.92 .. 9.1in) as equal columns.
+                    r1 = ph_map[1].left + ph_map[1].width
+                    r2 = ph_map[2].left + ph_map[2].width
+                    if r1 > _BODY_SAFE_RIGHT or r2 > _BODY_SAFE_RIGHT:
+                        col_w = (_BODY_SAFE_RIGHT - _BODY_SAFE_LEFT - _COL_GUTTER) // 2
+                        _place_ph(ph_map[1], _BODY_SAFE_LEFT, col_w)
+                        _place_ph(ph_map[2], _BODY_SAFE_LEFT + col_w + _COL_GUTTER, col_w)
+
                     mid = (len(body_text_boxes) + 1) // 2
                     left, right = body_text_boxes[:mid], body_text_boxes[mid:]
                     _fill_body(ph_map[1], _merge_boxes(left))
                     _fill_body(ph_map[2], _merge_boxes(right))
                     cols = [(ph_map[1], _merge_boxes(left)), (ph_map[2], _merge_boxes(right))]
                 else:
+                    # BUG-2: single body column — clamp its right edge clear of the
+                    # red wedge (only if it currently overruns it).
+                    if ph_map[1].left + ph_map[1].width > _BODY_SAFE_RIGHT:
+                        _place_ph(ph_map[1], ph_map[1].left, _BODY_SAFE_RIGHT - ph_map[1].left)
+
                     all_paras = _merge_boxes(body_text_boxes)
                     _fill_body(ph_map[1], all_paras)
                     cols = [(ph_map[1], all_paras)]
@@ -354,10 +416,10 @@ def transfer(
         elif body_text_boxes and 1 not in ph_map:
             # No body placeholder — add as floating text box
             try:
-                slide_w = dest_prs.slide_width
                 slide_h = dest_prs.slide_height
+                # BUG-2: keep the fallback textbox clear of the red wedge too.
                 txBox = dest_slide.shapes.add_textbox(
-                    Inches(0.5), Inches(1.5), slide_w - Inches(1), slide_h - Inches(2)
+                    Inches(0.5), Inches(1.5), _BODY_SAFE_RIGHT - Inches(0.5), slide_h - Inches(2)
                 )
                 all_paras = []
                 for i, box in enumerate(body_text_boxes):

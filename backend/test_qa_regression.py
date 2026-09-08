@@ -19,9 +19,11 @@ from pptx.util import Inches, Pt
 from pptx.enum.text import MSO_AUTO_SIZE
 
 from parser import parse_source
-from transfer import transfer
+from transfer import transfer, _BODY_SAFE_RIGHT
 from validator import validate
 from batch_convert import safe_path, out_name
+
+_EPS = Inches(0.05)  # tolerance for rounding in EMU geometry
 
 TEMPLATE = Path(r"C:\Users\saiva\OneDrive\Desktop\CUCOM Template.pptx")
 _passed = _failed = 0
@@ -190,6 +192,93 @@ def test_dims_and_determinism():
     check("two conversions structurally identical", f1 == f2)
 
 
+# ---------------------------------------------------------------------------
+# BUG-2  Body text must not run across the CUCOM red wedge.  The wedge's left
+#        edge inside the body span is ~9.30in; transfer() clamps body content
+#        to _BODY_SAFE_RIGHT (9.1in).  Must hold for single- and two-column
+#        layouts, must NOT break the BUG-1 two-column fix, must NOT touch
+#        title-only slides.
+# ---------------------------------------------------------------------------
+def _long_body_source(path):
+    prs = Presentation()
+    s = prs.slides.add_slide(prs.slide_layouts[1])
+    s.shapes.title.text = "Mitochondria"
+    body = s.placeholders[1].text_frame
+    body.text = ("Outer mitochondrial membrane: this forms a continuous envelope "
+                 "of the organelle and consists mostly of phospholipids and cholesterol "
+                 "and contains a specific membrane protein that forms porin channels.")
+    for i in range(6):
+        body.add_paragraph().text = (
+            f"Point {i}: a deliberately long lecture sentence that would, at full "
+            f"placeholder width, wrap across the saturated red wedge on the right.")
+    prs.save(str(path))
+    return path
+
+
+def test_bug2_single_column_clear_of_wedge():
+    src = _long_body_source(_tmp("longbody.pptx"))
+    sl = parse_source(str(src))
+    out = _tmp("longbody_out.pptx")
+    transfer(source_slides=sl, source_path=str(src), template_path=str(TEMPLATE),
+             output_path=str(out), progress_callback=None)
+    op = Presentation(str(out))
+    phs = {p.placeholder_format.idx: p for p in op.slides[0].placeholders}
+    check("single-column body present", 1 in phs)
+    if 1 in phs:
+        right_edge = phs[1].left + phs[1].width
+        check("body right edge <= safe right (clear of red wedge)",
+              right_edge <= _BODY_SAFE_RIGHT + _EPS,
+              f"right_edge={right_edge/914400:.2f}in  safe={_BODY_SAFE_RIGHT/914400:.2f}in")
+        check("full body text preserved after narrowing",
+              "porin channels" in phs[1].text_frame.text and "Point 5" in phs[1].text_frame.text)
+
+
+def test_bug2_two_columns_clear_of_wedge_and_bug1_intact():
+    src = _two_column_source(_tmp("tc_wedge.pptx"))
+    sl = parse_source(str(src))
+    out = _tmp("tc_wedge_out.pptx")
+    transfer(source_slides=sl, source_path=str(src), template_path=str(TEMPLATE),
+             output_path=str(out), progress_callback=None)
+    op = Presentation(str(out))
+    phs = {p.placeholder_format.idx: p for p in op.slides[0].placeholders}
+    check("two content placeholders present", 1 in phs and 2 in phs)
+    if 1 in phs and 2 in phs:
+        r1 = phs[1].left + phs[1].width
+        r2 = phs[2].left + phs[2].width
+        check("left column right edge <= safe right", r1 <= _BODY_SAFE_RIGHT + _EPS,
+              f"{r1/914400:.2f}in")
+        check("right column right edge <= safe right (no red-wedge overlap)",
+              r2 <= _BODY_SAFE_RIGHT + _EPS, f"{r2/914400:.2f}in")
+        check("columns do not overlap horizontally", phs[2].left >= r1 - _EPS,
+              f"col2.left={phs[2].left/914400:.2f}  col1.right={r1/914400:.2f}")
+        # BUG-1 must still hold: both columns carry content, 2nd column not lost
+        t1, t2 = phs[1].text_frame.text.lower(), phs[2].text_frame.text.lower()
+        check("BUG-1 intact: left column non-empty", bool(t1.strip()))
+        check("BUG-1 intact: right column non-empty", bool(t2.strip()))
+        check("BUG-1 intact: 'pathological cause number 12' still present",
+              "pathological cause number 12" in (t1 + " " + t2))
+
+
+def test_bug2_title_only_body_geometry_untouched():
+    prs = Presentation()
+    s = prs.slides.add_slide(prs.slide_layouts[5])  # title only
+    s.shapes.title.text = "Section: Cardiovascular Physiology"
+    src = _tmp("titleonly.pptx")
+    prs.save(str(src))
+    sl = parse_source(str(src))
+    out = _tmp("titleonly_out.pptx")
+    res = transfer(source_slides=sl, source_path=str(src), template_path=str(TEMPLATE),
+                   output_path=str(out), progress_callback=None)
+    op = Presentation(str(out))
+    s0 = op.slides[0]
+    body_phs = [p for p in s0.placeholders if p.placeholder_format.idx in (1, 2)
+                and p.has_text_frame and p.text_frame.text.strip()]
+    check("title-only slide has no populated body placeholder", not body_phs)
+    check("title text preserved", any("Cardiovascular Physiology" in sh.text_frame.text
+          for sh in s0.shapes if sh.has_text_frame))
+    check("no transfer errors on title-only slide", not any(r.errors for r in res))
+
+
 if __name__ == "__main__":
     if not TEMPLATE.exists():
         sys.exit(f"template not found: {TEMPLATE}")
@@ -197,7 +286,10 @@ if __name__ == "__main__":
     print("=" * 50)
     for fn in [test_two_column_not_stacked, test_body_autofit_shrink,
                test_source_not_modified, test_batch_isolation,
-               test_safe_path_no_overwrite, test_dims_and_determinism]:
+               test_safe_path_no_overwrite, test_dims_and_determinism,
+               test_bug2_single_column_clear_of_wedge,
+               test_bug2_two_columns_clear_of_wedge_and_bug1_intact,
+               test_bug2_title_only_body_geometry_untouched]:
         print(f"\n{fn.__name__}:")
         try:
             fn()
