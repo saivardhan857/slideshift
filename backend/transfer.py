@@ -6,6 +6,7 @@ from typing import Optional
 from pptx import Presentation
 from pptx.util import Emu, Pt, Inches
 from pptx.dml.color import RGBColor
+from pptx.enum.text import MSO_AUTO_SIZE
 from pptx.oxml.ns import qn as _qn
 
 
@@ -160,8 +161,13 @@ def _write_paragraphs_to_tf(tf, paragraphs: list[Paragraph], clear_first=True):
                 r.text = para.full_text
 
 
-def _estimate_text_height(tf, paragraphs: list[Paragraph]) -> int:
-    """Rough height estimate in EMU. ~914400 EMU per inch, ~12pt = ~152400 EMU/line."""
+def _estimate_text_height(tf, paragraphs: list[Paragraph], width_emu: int = 0) -> int:
+    """Rough height estimate in EMU. ~914400 EMU per inch, ~12pt = ~152400 EMU/line.
+
+    width_emu is accepted for call-site compatibility but the estimate stays a
+    conservative per-paragraph line count so the overflow warning only fires on
+    genuinely extreme density (autofit handles the rest).
+    """
     line_height_emu = int(Pt(14).emu)  # 14pt per line as default
     total = 0
     for para in paragraphs:
@@ -298,27 +304,50 @@ def transfer(
         # --- Transfer body text ---
         body_text_boxes = [b for b in parsed.body_boxes if b.full_text.strip()]
 
-        if body_text_boxes and 1 in ph_map:
-            body_ph = ph_map[1]
-            # Combine all body boxes into one placeholder
-            all_paras = []
-            for i, box in enumerate(body_text_boxes):
+        def _merge_boxes(boxes):
+            from parser import Paragraph as Para, TextRun as TR
+            merged = []
+            for i, box in enumerate(boxes):
                 if i > 0:
-                    # Separator between multiple text boxes
-                    from parser import Paragraph as Para, TextRun as TR
-                    all_paras.append(Para(runs=[TR(text="")]))
-                all_paras.extend(box.paragraphs)
+                    merged.append(Para(runs=[TR(text="")]))
+                merged.extend(box.paragraphs)
+            return merged
 
+        def _fill_body(ph, paras):
+            """Write paragraphs into a body placeholder and let PowerPoint
+            shrink text to fit so nothing is clipped off-slide."""
+            _write_paragraphs_to_tf(ph.text_frame, paras)
             try:
-                _write_paragraphs_to_tf(body_ph.text_frame, all_paras)
+                ph.text_frame.word_wrap = True
+                ph.text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+            except Exception:
+                pass
 
-                # Overflow detection
-                est_h = _estimate_text_height(body_ph.text_frame, all_paras)
-                if est_h > body_ph.height * OVERFLOW_THRESHOLD:
-                    result.overflow = True
-                    result.warnings.append(
-                        f"⚠ Slide {parsed.index + 1} — content may exceed available space. Review recommended."
-                    )
+        if body_text_boxes and 1 in ph_map:
+            try:
+                # Two-column source + a layout that actually has a 2nd content
+                # placeholder → spread the boxes across both columns instead of
+                # stacking them all in the (often half-width) first one.
+                if len(body_text_boxes) >= 2 and 2 in ph_map:
+                    mid = (len(body_text_boxes) + 1) // 2
+                    left, right = body_text_boxes[:mid], body_text_boxes[mid:]
+                    _fill_body(ph_map[1], _merge_boxes(left))
+                    _fill_body(ph_map[2], _merge_boxes(right))
+                    cols = [(ph_map[1], _merge_boxes(left)), (ph_map[2], _merge_boxes(right))]
+                else:
+                    all_paras = _merge_boxes(body_text_boxes)
+                    _fill_body(ph_map[1], all_paras)
+                    cols = [(ph_map[1], all_paras)]
+
+                # Overflow detection (informational — autofit already prevents clipping)
+                for ph, paras in cols:
+                    est_h = _estimate_text_height(ph.text_frame, paras, ph.width)
+                    if est_h > ph.height * OVERFLOW_THRESHOLD:
+                        result.overflow = True
+                        result.warnings.append(
+                            f"⚠ Slide {parsed.index + 1} — content may exceed available space. Review recommended."
+                        )
+                        break
             except Exception as e:
                 result.errors.append(f"Body transfer failed: {e}")
 
