@@ -24,9 +24,9 @@ def _dedupe_pptx(path: str):
 
 from parser import ParsedSlide, TextBox, Paragraph, TextRun, ImageData, TableData
 from layout_matcher import TemplateLayout, SlideType, find_best_layout, analyze_template, classify_source_slide
+from layout_safety import plan_fit
 
 
-OVERFLOW_THRESHOLD = 0.95  # flag slide if content uses >95% of placeholder height
 # ponytail: hardcoded for CUCOM template whose logo occupies ~0-1.88in in background image
 _TITLE_MIN_LEFT = Inches(2.0)
 
@@ -185,21 +185,6 @@ def _write_paragraphs_to_tf(tf, paragraphs: list[Paragraph], clear_first=True):
                 r.text = para.full_text
 
 
-def _estimate_text_height(tf, paragraphs: list[Paragraph], width_emu: int = 0) -> int:
-    """Rough height estimate in EMU. ~914400 EMU per inch, ~12pt = ~152400 EMU/line.
-
-    width_emu is accepted for call-site compatibility but the estimate stays a
-    conservative per-paragraph line count so the overflow warning only fires on
-    genuinely extreme density (autofit handles the rest).
-    """
-    line_height_emu = int(Pt(14).emu)  # 14pt per line as default
-    total = 0
-    for para in paragraphs:
-        total += line_height_emu
-        # Multi-line wrapping is hard to estimate without rendering — skip for now
-    return total
-
-
 def _add_image_to_slide(slide, img: ImageData, placeholder=None):
     """Add an image to a slide, fitting into placeholder bounds if given."""
     if placeholder is not None:
@@ -338,38 +323,31 @@ def transfer(
             return merged
 
         def _fill_body(ph, paras):
-            """Write paragraphs into a body placeholder and enable PowerPoint
-            shrink-to-fit. For the rare box that is *badly* over-full even after
-            the width fix, bake a mild fontScale (>=0.75) so it also renders
-            correctly in non-PowerPoint viewers; mildly-full boxes are left for
-            PowerPoint's own autofit so their font size is untouched."""
+            """Write body paragraphs, enable PowerPoint shrink-to-fit, then run
+            the layout-safety fitter (layout_safety.plan_fit) on this column's
+            actual dimensions. The fitter applies the least-destructive
+            adjustment in order: nothing -> reduce line spacing -> reduce font
+            (floored at 75% of the intended size). If content still overflows
+            after that, a per-slide warning is recorded and the best-effort
+            floor is baked into normAutofit so the deck still renders."""
             _write_paragraphs_to_tf(ph.text_frame, paras)
             tf = ph.text_frame
             try:
                 tf.word_wrap = True
                 tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
             except Exception:
-                return
-            box_w_in = max(ph.width / 914400.0, 1.0)
-            box_h_in = max(ph.height / 914400.0, 1.0)
-            need_in = 0.0
-            for para in paras:
-                txt = para.full_text
-                if not txt.strip():
-                    need_in += 18.0 * 1.15 / 72.0  # blank separator line
-                    continue
-                sizes = [r.font_size for r in para.runs if r.font_size]
-                pt = min(sizes) if sizes else 18.0
-                cpl = max(8, int(box_w_in / (0.46 * pt / 72.0)))  # ~0.46em avg glyph
-                lines = max(1, -(-len(txt) // cpl))
-                need_in += lines * (pt * 1.15 / 72.0)
-            # Only intervene when clearly over-full; PowerPoint handles the rest.
-            if need_in > box_h_in * 1.15:
-                scale = max(0.75, box_h_in / need_in)
+                return None
+
+            plan = plan_fit(paras, ph.width, ph.height)
+            if plan.font_scale < 1.0 or plan.line_spacing_reduction > 0.0:
                 na = tf._txBody.find(f'.//{{{_NS_A}}}bodyPr/{{{_NS_A}}}normAutofit')
                 if na is not None:
-                    na.set('fontScale', str(int(round(scale * 100000))))
-                    na.set('lnSpcReduction', '10000')
+                    na.set('fontScale', str(int(round(plan.font_scale * 100000))))
+                    na.set('lnSpcReduction', str(int(round(plan.line_spacing_reduction * 100000))))
+            if plan.warning:
+                result.overflow = True
+                result.warnings.append(f"⚠ Slide {parsed.index + 1} — {plan.warning}.")
+            return plan
 
         if body_text_boxes and 1 in ph_map:
             try:
@@ -388,28 +366,17 @@ def transfer(
 
                     mid = (len(body_text_boxes) + 1) // 2
                     left, right = body_text_boxes[:mid], body_text_boxes[mid:]
+                    # Each column is fitted independently against its own
+                    # (post-split, post-BUG-2-clamp) dimensions.
                     _fill_body(ph_map[1], _merge_boxes(left))
                     _fill_body(ph_map[2], _merge_boxes(right))
-                    cols = [(ph_map[1], _merge_boxes(left)), (ph_map[2], _merge_boxes(right))]
                 else:
                     # BUG-2: single body column — clamp its right edge clear of the
                     # red wedge (only if it currently overruns it).
                     if ph_map[1].left + ph_map[1].width > _BODY_SAFE_RIGHT:
                         _place_ph(ph_map[1], ph_map[1].left, _BODY_SAFE_RIGHT - ph_map[1].left)
 
-                    all_paras = _merge_boxes(body_text_boxes)
-                    _fill_body(ph_map[1], all_paras)
-                    cols = [(ph_map[1], all_paras)]
-
-                # Overflow detection (informational — autofit already prevents clipping)
-                for ph, paras in cols:
-                    est_h = _estimate_text_height(ph.text_frame, paras, ph.width)
-                    if est_h > ph.height * OVERFLOW_THRESHOLD:
-                        result.overflow = True
-                        result.warnings.append(
-                            f"⚠ Slide {parsed.index + 1} — content may exceed available space. Review recommended."
-                        )
-                        break
+                    _fill_body(ph_map[1], _merge_boxes(body_text_boxes))
             except Exception as e:
                 result.errors.append(f"Body transfer failed: {e}")
 
