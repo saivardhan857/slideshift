@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -200,13 +200,14 @@ async def transfer_endpoint(
 
 
 @app.get("/api/download/{job_id}")
-async def download(job_id: str, background_tasks: BackgroundTasks):
+async def download(job_id: str):
     if ".." in job_id or "/" in job_id or "\\" in job_id:
         raise HTTPException(400, "Invalid job ID.")
     output_path = TEMP_DIR / job_id / "Converted_Presentation.pptx"
     if not output_path.exists():
         raise HTTPException(404, "File not found or already cleaned up. Please re-run the transfer.")
-    background_tasks.add_task(_cleanup_job, TEMP_DIR / job_id)
+    # No cleanup here — the browser may issue the request twice and users
+    # re-click Download. _delayed_cleanup (10 min) + startup sweep collect it.
     return FileResponse(
         path=str(output_path),
         media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",

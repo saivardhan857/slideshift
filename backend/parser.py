@@ -1,5 +1,6 @@
 """Parse source PPTX into a structured representation."""
 
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 from pptx import Presentation
@@ -117,6 +118,14 @@ class ParsedSlide:
     @property
     def has_table(self) -> bool:
         return len(self.tables) > 0
+
+
+_LIST_FRAGMENT_RE = re.compile(r"^\s*(\d+[.)]|[-•*·▪‣●○])\s")
+
+
+def _looks_like_list_fragment(text: str) -> bool:
+    """A bullet/number-prefixed line is body content, not a slide title."""
+    return bool(_LIST_FRAGMENT_RE.match(text or ""))
 
 
 def _parse_color(color) -> Optional[str]:
@@ -241,6 +250,7 @@ def parse_source(path: str) -> list[ParsedSlide]:
         parsed = ParsedSlide(
             index=idx,
             layout_name=slide.slide_layout.name if slide.slide_layout else None,
+            source_shape_count=len(slide.shapes),
         )
 
         for shape in slide.shapes:
@@ -267,13 +277,14 @@ def parse_source(path: str) -> list[ParsedSlide]:
 
                 # Identify title vs body by placeholder type/idx or position heuristic
                 if ph is not None:
-                    from pptx.enum.text import PP_ALIGN
-                    from pptx.util import Emu
-                    # idx 0 = title, idx 1 = body/content
-                    if ph.idx == 0 or (ph.type is not None and str(ph.type) in ("CENTER_TITLE(3)", "TITLE(15)")):
+                    ph_type_name = ph.type.name if ph.type is not None else ""
+                    # Some decks stuff the heading into a mislabelled placeholder
+                    # (idx != 0, type OBJECT) that is still *named* "Title N".
+                    name_is_title = shape.name.lower().startswith("title")
+                    if ph.idx == 0 or ph_type_name in ("TITLE", "CENTER_TITLE"):
                         tb.is_title = True
-                    elif ph.idx == 1:
-                        tb.is_body = True
+                    elif name_is_title and not _looks_like_list_fragment(shape.text_frame.text.strip()):
+                        tb.is_title = True
                     else:
                         tb.is_body = True
                 else:
@@ -281,9 +292,11 @@ def parse_source(path: str) -> list[ParsedSlide]:
                     slide_height = prs.slide_height
                     text = shape.text_frame.text.strip()
                     name_is_title = shape.name.lower().startswith('title')
-                    if name_is_title:
+                    if name_is_title and not _looks_like_list_fragment(text):
                         tb.is_title = True
-                    elif len(text) <= 100 and len(shape.text_frame.paragraphs) <= 2 and shape.top < slide_height * 0.2:
+                    elif (len(text) <= 100 and len(shape.text_frame.paragraphs) <= 2
+                          and shape.top < slide_height * 0.2
+                          and not _looks_like_list_fragment(text)):
                         tb.is_title = True
                     else:
                         tb.is_body = True
