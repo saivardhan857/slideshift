@@ -8,6 +8,8 @@ from pptx.util import Pt
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 import io
 
+from compat import SupportLevel, classify_shape
+
 _SMARTART_NS = 'http://schemas.openxmlformats.org/drawingml/2006/diagram'
 _DRAWING_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
 _REL_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
@@ -17,6 +19,9 @@ _REL_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
 class UnsupportedShape:
     type: str   # "chart" | "smartart" | "group" | "wordart" | "ole" | "media"
     label: str  # human-readable name shown in warnings
+    # V2: how much of this shape the transfer engine could carry (compat.SupportLevel value).
+    support_level: str = SupportLevel.SKIPPED_WITH_WARNING.value
+    detail: str = ""
 
 
 @dataclass
@@ -212,34 +217,55 @@ def _parse_table(shape) -> TableData:
 
 
 def _detect_unsupported_shape(shape) -> Optional[UnsupportedShape]:
-    """Return UnsupportedShape for content-bearing shapes the parser cannot handle, else None."""
-    if shape.has_table or shape.has_text_frame or shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
-        return None
-    st = shape.shape_type
-    # Decorative — no transferable content
-    if st in (MSO_SHAPE_TYPE.LINE, MSO_SHAPE_TYPE.AUTO_SHAPE,
-              MSO_SHAPE_TYPE.FREEFORM, MSO_SHAPE_TYPE.PLACEHOLDER):
-        return None
-    if st == MSO_SHAPE_TYPE.CHART:
-        return UnsupportedShape("chart", "Chart")
-    if st == MSO_SHAPE_TYPE.GROUP:
-        return UnsupportedShape("group", "Grouped Shapes")
-    if st == MSO_SHAPE_TYPE.TEXT_EFFECT:
-        return UnsupportedShape("wordart", "WordArt")
-    if st in (MSO_SHAPE_TYPE.EMBEDDED_OLE_OBJECT, MSO_SHAPE_TYPE.LINKED_OLE_OBJECT):
-        return UnsupportedShape("ole", "Embedded Object")
-    if st == MSO_SHAPE_TYPE.MEDIA:
-        return UnsupportedShape("media", "Media (Video/Audio)")
-    # SmartArt: graphicFrame with diagram namespace
-    try:
-        if shape.element.find(f'.//{{{_SMARTART_NS}}}relIds') is not None:
-            return UnsupportedShape("smartart", "SmartArt")
-        gd = shape.element.find(f'.//{{{_DRAWING_NS}}}graphicData')
-        if gd is not None and gd.get('uri') == _SMARTART_NS:
-            return UnsupportedShape("smartart", "SmartArt")
-    except Exception:
-        pass
+    """Return an UnsupportedShape (carrying its compat support level) for content
+    the transfer engine cannot carry and the user should be told about, else None.
+
+    Fully-supported shapes and decorative shapes with no transferable content
+    return None — same warning surface as V1, now routed through compat.py.
+    Grouped shapes are handled by _parse_group() in parse_source(), not here.
+    """
+    c = classify_shape(shape)
+    if c.level == SupportLevel.SKIPPED_WITH_WARNING:
+        return UnsupportedShape(c.kind, c.label, c.level.value, c.detail)
     return None
+
+
+def _parse_group(group_shape, parsed) -> bool:
+    """Salvage text from a grouped shape into parsed.body_boxes (recursing into
+    nested groups). Groups are not transferred structurally; lifting their text
+    out is better than dropping the whole group. Records one UnsupportedShape
+    for the group whose support level reflects whether text was salvaged.
+    Returns True if any text was recovered."""
+    salvaged = False
+    try:
+        children = list(group_shape.shapes)
+    except Exception:
+        children = []
+    for sub in children:
+        try:
+            st = sub.shape_type
+        except Exception:
+            st = None
+        if st == MSO_SHAPE_TYPE.GROUP:
+            if _parse_group(sub, parsed):
+                salvaged = True
+        else:
+            try:
+                has_tf = sub.has_text_frame and sub.text_frame.text.strip()
+            except Exception:
+                has_tf = False
+            if has_tf:
+                parsed.body_boxes.append(TextBox(
+                    paragraphs=_parse_text_frame(sub.text_frame),
+                    is_body=True,
+                ))
+                salvaged = True
+
+    c = classify_shape(group_shape)  # PARTIALLY_SUPPORTED if text present, else SKIPPED_WITH_WARNING
+    parsed.unsupported_shapes.append(
+        UnsupportedShape(c.kind, c.label, c.level.value, c.detail)
+    )
+    return salvaged
 
 
 def parse_source(path: str) -> list[ParsedSlide]:
@@ -263,6 +289,9 @@ def parse_source(path: str) -> list[ParsedSlide]:
                 img = _parse_pic_placeholder(shape, slide)
                 if img is not None:
                     parsed.images.append(img)
+            elif shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+                # V2: salvage text from grouped shapes instead of dropping them
+                _parse_group(shape, parsed)
             elif shape.has_text_frame:
                 ph = shape.placeholder_format if shape.is_placeholder else None
                 tb = TextBox(

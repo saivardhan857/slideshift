@@ -457,33 +457,49 @@ def transfer(
 
         # --- Unsupported content warnings ---
         if parsed.unsupported_shapes:
+            slide_num = parsed.index + 1
+            # De-dupe by shape kind, keeping label + V2 support level.
             seen = {}
             for us in parsed.unsupported_shapes:
-                seen.setdefault(us.type, us.label)
+                level = getattr(us, "support_level", "SKIPPED_WITH_WARNING")
+                seen.setdefault(us.type, (us.label, level))
 
-            labels = list(seen.values())
-            slide_num = parsed.index + 1
-            for us_type, us_label in seen.items():
+            for us_type, (us_label, level) in seen.items():
+                if level == "PARTIALLY_SUPPORTED":
+                    msg = (f"{us_label}: text content was salvaged; other elements "
+                           f"could not be transferred.")
+                else:
+                    msg = f"{us_label} content could not be transferred automatically."
                 result.content_warnings.append({
                     "slide": slide_num,
                     "type": us_type,
-                    "message": f"{us_label} content could not be transferred automatically.",
+                    "support_level": level,
+                    "message": msg,
                 })
 
-            has_transferred = (
-                parsed.title is not None
-                or any(b.full_text.strip() for b in parsed.body_boxes)
-                or parsed.images
-                or parsed.tables
-            )
-            if not has_transferred:
-                result.warnings.append(
-                    f"⚠ Slide {slide_num} could not be fully transferred because it contains "
-                    f"unsupported PowerPoint content: {', '.join(labels)}."
+            skipped = [lbl for lbl, lvl in seen.values() if lvl != "PARTIALLY_SUPPORTED"]
+            partial = [lbl for lbl, lvl in seen.values() if lvl == "PARTIALLY_SUPPORTED"]
+
+            if skipped:
+                has_transferred = (
+                    parsed.title is not None
+                    or any(b.full_text.strip() for b in parsed.body_boxes)
+                    or parsed.images
+                    or parsed.tables
                 )
-            else:
+                if not has_transferred:
+                    result.warnings.append(
+                        f"⚠ Slide {slide_num} could not be fully transferred because it contains "
+                        f"unsupported PowerPoint content: {', '.join(skipped)}."
+                    )
+                else:
+                    result.warnings.append(
+                        f"⚠ Slide {slide_num} contains unsupported content that was skipped: {', '.join(skipped)}."
+                    )
+            if partial:
                 result.warnings.append(
-                    f"⚠ Slide {slide_num} contains unsupported content that was skipped: {', '.join(labels)}."
+                    f"⚠ Slide {slide_num}: text from grouped shapes was salvaged; "
+                    f"other grouped elements were not transferred ({', '.join(partial)})."
                 )
 
         results.append(result)
