@@ -35,3 +35,6 @@ python test_title_detection.py
 
 Deployed on Render from `render.yaml` (branch `main`, root directory `backend`,
 auto-deploy on commit). Production: https://slideshift.onrender.com
+
+<!-- GitHub App reconnected; verifying push-triggered auto-deploy. -->
+
