@@ -35,9 +35,11 @@ def validate(output_path: str, source_slide_count: int, transfer_results) -> Val
     # Valid PPTX
     try:
         prs = Presentation(output_path)
-    except Exception as e:
+    except Exception:
+        # Detail intentionally omitted from the user-facing report — the raw
+        # python-pptx exception can carry filesystem paths.
         report.ok = False
-        report.messages.append(f"Output file cannot be opened as a valid PPTX: {e}")
+        report.messages.append("The generated file is not a valid PowerPoint presentation.")
         return report
 
     report.slide_count_output = len(prs.slides)

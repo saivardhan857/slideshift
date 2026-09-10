@@ -11,14 +11,25 @@ from pptx.oxml.ns import qn as _qn
 
 
 def _dedupe_pptx(path: str):
-    """Remove duplicate ZIP entries from a PPTX, keeping the last occurrence of each name."""
-    buf = io.BytesIO()
+    """Remove duplicate ZIP entries from a PPTX, keeping the last occurrence of
+    each name (python-pptx can serialise a stripped slide's parts twice, which
+    corrupts the file).
+
+    Streamed copy: one pass over infolist() (metadata only) picks the last index
+    per filename, a second pass copies just those entries. Peak memory is the
+    single largest entry rather than the whole decompressed package, which
+    matters for large image-heavy decks on a small instance.
+    """
     with zipfile.ZipFile(path, 'r') as src:
-        # Dict preserves insertion order; duplicate keys overwrite → last one wins
-        entries = {info.filename: (info, src.read(info.filename)) for info in src.infolist()}
-    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as dst:
-        for fname, (info, data) in entries.items():
-            dst.writestr(info, data)
+        infos = src.infolist()
+        last_idx = {}
+        for i, info in enumerate(infos):
+            last_idx[info.filename] = i
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as dst:
+            for i, info in enumerate(infos):
+                if last_idx[info.filename] == i:
+                    dst.writestr(info, src.read(info.filename))
     with open(path, 'wb') as f:
         f.write(buf.getvalue())
 
@@ -126,6 +137,9 @@ class TransferResult:
         self.errors: list[str] = []
         self.overflow: bool = False
         self.content_warnings: list[dict] = []
+        # V2 Phase 4 diagnostics: one layout_safety action per body column filled
+        # ("none" | "reduce_spacing" | "reduce_font" | "overflow").
+        self.fit_actions: list[str] = []
 
 
 def _apply_run_formatting(dest_run, src_run: TextRun):
@@ -339,6 +353,7 @@ def transfer(
                 return None
 
             plan = plan_fit(paras, ph.width, ph.height)
+            result.fit_actions.append(plan.action)
             if plan.font_scale < 1.0 or plan.line_spacing_reduction > 0.0:
                 na = tf._txBody.find(f'.//{{{_NS_A}}}bodyPr/{{{_NS_A}}}normAutofit')
                 if na is not None:
