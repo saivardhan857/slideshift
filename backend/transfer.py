@@ -1,7 +1,9 @@
 """Core content transfer engine."""
 
 import io
+import hashlib
 import zipfile
+from collections import defaultdict
 from typing import Optional
 from pptx import Presentation
 from pptx.util import Emu, Pt, Inches
@@ -71,46 +73,57 @@ _NS_R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
 
 
 def _extract_design_images(template_prs):
-    """Extract background picture shapes from a representative template content slide."""
-    ref_slide = None
-    for slide in template_prs.slides:
-        if 'title and content' in slide.slide_layout.name.lower():
-            ref_slide = slide
-            break
-    if ref_slide is None and template_prs.slides:
-        ref_slide = template_prs.slides[0]
-    if ref_slide is None:
+    """Return pictures that are template *decoration* — the same image, in the
+    same spot, repeated across most of the template's slides (a full-bleed
+    background, watermark, or logo bar). Content photos, which differ slide to
+    slide, are left alone; that stops a normal deck used as a template from
+    stamping its slide-1 photos onto every output slide.
+    """
+    slides = list(template_prs.slides)
+    if len(slides) < 2:
         return []
 
-    src_part = ref_slide.part
-    spTree = ref_slide.element.find(f'{{{_NS_P}}}cSld/{{{_NS_P}}}spTree')
-    if spTree is None:
-        return []
+    seen = defaultdict(lambda: {"count": 0, "geom": None, "blob": None})
+    for slide in slides:
+        spTree = slide.element.find(f'{{{_NS_P}}}cSld/{{{_NS_P}}}spTree')
+        if spTree is None:
+            continue
+        slide_keys = set()
+        for child in spTree:
+            if child.tag.split('}')[-1] != 'pic':
+                continue
+            blip = child.find(f'.//{{{_NS_A}}}blip')
+            if blip is None:
+                continue
+            rId = blip.get(f'{{{_NS_R}}}embed')
+            if not rId:
+                continue
+            try:
+                blob = slide.part.related_part(rId).blob
+            except Exception:
+                continue
+            xfrm = child.find(f'.//{{{_NS_A}}}xfrm')
+            if xfrm is None:
+                continue
+            off = xfrm.find(f'{{{_NS_A}}}off')
+            ext = xfrm.find(f'{{{_NS_A}}}ext')
+            if off is None or ext is None:
+                continue
+            key = (hashlib.md5(blob).hexdigest(),
+                   off.get('x'), off.get('y'), ext.get('cx'), ext.get('cy'))
+            if key in slide_keys:      # same pic twice on one slide — count once
+                continue
+            slide_keys.add(key)
+            rec = seen[key]
+            rec["count"] += 1
+            if rec["geom"] is None:
+                rec["geom"] = (int(off.get('x', 0)), int(off.get('y', 0)),
+                               int(ext.get('cx', 0)), int(ext.get('cy', 0)))
+                rec["blob"] = blob
 
-    result = []
-    for child in spTree:
-        if child.tag.split('}')[-1] != 'pic':
-            continue
-        blip = child.find(f'.//{{{_NS_A}}}blip')
-        if blip is None:
-            continue
-        rId = blip.get(f'{{{_NS_R}}}embed')
-        if not rId:
-            continue
-        try:
-            blob = src_part.related_part(rId).blob
-        except Exception:
-            continue
-        xfrm = child.find(f'.//{{{_NS_A}}}xfrm')
-        if xfrm is None:
-            continue
-        off = xfrm.find(f'{{{_NS_A}}}off')
-        ext = xfrm.find(f'{{{_NS_A}}}ext')
-        if off is None or ext is None:
-            continue
-        result.append((blob, int(off.get('x', 0)), int(off.get('y', 0)),
-                       int(ext.get('cx', 0)), int(ext.get('cy', 0))))
-    return result
+    threshold = max(2, int(0.6 * len(slides)))
+    return [(rec["blob"], *rec["geom"])
+            for rec in seen.values() if rec["count"] >= threshold]
 
 
 def _has_fullbleed_bg(design_images, slide_w, slide_h):
@@ -213,8 +226,15 @@ def _write_paragraphs_to_tf(tf, paragraphs: list[Paragraph], clear_first=True):
                 r.text = para.full_text
 
 
-def _add_image_to_slide(slide, img: ImageData, placeholder=None):
-    """Add an image to a slide, fitting into placeholder bounds if given."""
+def _add_image_to_slide(slide, img: ImageData, placeholder=None,
+                        slide_w=None, slide_h=None):
+    """Add an image to a slide, fitting into placeholder bounds if given.
+
+    With no destination placeholder the image is placed at its source
+    coordinates/size. The source slide is often larger than this template's, so
+    when slide_w/slide_h are supplied the image is scaled down and nudged to
+    stay fully on-canvas.
+    """
     if placeholder is not None:
         left = placeholder.left
         top = placeholder.top
@@ -234,10 +254,21 @@ def _add_image_to_slide(slide, img: ImageData, placeholder=None):
         width = int(src_w * ratio)
         height = int(src_h * ratio)
 
+    if placeholder is None and slide_w and slide_h:
+        margin = Inches(0.1)
+        max_w, max_h = slide_w - 2 * margin, slide_h - 2 * margin
+        if width > max_w or height > max_h:
+            fit = min(max_w / width, max_h / height)
+            width = int(width * fit)
+            height = int(height * fit)
+        left = min(max(left, margin), slide_w - margin - width)
+        top = min(max(top, margin), slide_h - margin - height)
+
     slide.shapes.add_picture(img_stream, left, top, width, height)
 
 
-def _add_table_to_slide(slide, tbl: TableData, placeholder=None):
+def _add_table_to_slide(slide, tbl: TableData, placeholder=None,
+                        slide_w=None, slide_h=None):
     """Add a table to a slide."""
     if tbl.row_count == 0 or tbl.col_count == 0:
         return
@@ -248,6 +279,13 @@ def _add_table_to_slide(slide, tbl: TableData, placeholder=None):
     else:
         left, top = tbl.left, tbl.top
         width, height = tbl.width, tbl.height
+        # Source coords may exceed a smaller destination canvas — clamp width
+        # and left so the table stays on-slide (row height handles itself).
+        if slide_w and slide_h:
+            margin = Inches(0.1)
+            width = min(width, slide_w - 2 * margin)
+            left = min(max(left, margin), slide_w - margin - width)
+            top = max(min(top, slide_h - margin), margin)
 
     rows, cols = tbl.row_count, tbl.col_count
     dest_table = slide.shapes.add_table(rows, cols, left, top, width, height).table
@@ -444,7 +482,9 @@ def transfer(
                     ):
                         img_ph = ph
                         break
-                _add_image_to_slide(dest_slide, img, placeholder=img_ph)
+                _add_image_to_slide(dest_slide, img, placeholder=img_ph,
+                                    slide_w=dest_prs.slide_width,
+                                    slide_h=dest_prs.slide_height)
             except Exception as e:
                 result.warnings.append(f"Image on slide {parsed.index + 1} could not be transferred: {e}")
 
@@ -453,7 +493,9 @@ def transfer(
             try:
                 # Look for content placeholder for table
                 tbl_ph = ph_map.get(1) if 1 in ph_map and not body_text_boxes else None
-                _add_table_to_slide(dest_slide, tbl, placeholder=tbl_ph)
+                _add_table_to_slide(dest_slide, tbl, placeholder=tbl_ph,
+                                    slide_w=dest_prs.slide_width,
+                                    slide_h=dest_prs.slide_height)
             except Exception as e:
                 result.warnings.append(f"Table on slide {parsed.index + 1} could not be transferred: {e}")
 
@@ -503,6 +545,21 @@ def transfer(
                     f"⚠ Slide {slide_num}: text from grouped shapes was salvaged; "
                     f"other grouped elements were not transferred ({', '.join(partial)})."
                 )
+
+        # A slide whose source held only untransferable content would otherwise
+        # be an empty page — leave a visible marker instead.
+        if len(dest_slide.shapes) == 0:
+            kinds = ", ".join(sorted({u.label for u in parsed.unsupported_shapes})) \
+                if parsed.unsupported_shapes else "content"
+            try:
+                note = dest_slide.shapes.add_textbox(
+                    Inches(0.5), Inches(0.5),
+                    dest_prs.slide_width - Inches(1), Inches(1))
+                note.text_frame.text = (
+                    f"[Original slide {parsed.index + 1}: {kinds} could not be "
+                    f"transferred automatically — recreate manually.]")
+            except Exception:
+                pass
 
         results.append(result)
 
