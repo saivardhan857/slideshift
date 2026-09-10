@@ -113,6 +113,20 @@ def _extract_design_images(template_prs):
     return result
 
 
+def _has_fullbleed_bg(design_images, slide_w, slide_h):
+    """True when the template hides decoration in a (near) full-bleed background
+    image — the CUCOM case, where body text must be clamped off it. A normal
+    template has no such image and its placeholder geometry is used as-is.
+
+    design_images entries are (blob, x, y, cx, cy) in EMU.
+    """
+    for _blob, x, y, cx, cy in design_images:
+        if (x <= Inches(0.15) and y <= Inches(0.15)
+                and cx >= slide_w * 0.98 and cy >= slide_h * 0.98):
+            return True
+    return False
+
+
 def _add_background_images(dest_slide, design_images):
     """Inject background images behind all slide content."""
     spTree = dest_slide.element.find(f'{{{_NS_P}}}cSld/{{{_NS_P}}}spTree')
@@ -263,6 +277,10 @@ def transfer(
 
     # Extract background design images before stripping template slides
     design_images = _extract_design_images(dest_prs)
+    # CUCOM-style templates need body text clamped off a full-bleed background
+    # wedge; plain templates don't — keep their native placeholder geometry.
+    wedge_template = _has_fullbleed_bg(
+        design_images, dest_prs.slide_width, dest_prs.slide_height)
 
     # Remove all existing slides — must drop parts AND relationships to avoid
     # duplicate ZIP entries (which corrupt the output file)
@@ -301,7 +319,7 @@ def transfer(
         # --- Transfer title ---
         if parsed.title and 0 in ph_map:
             title_ph = ph_map[0]
-            if title_ph.left < _TITLE_MIN_LEFT:
+            if wedge_template and title_ph.left < _TITLE_MIN_LEFT:
                 orig_right = title_ph.left + title_ph.width
                 orig_top = title_ph.top       # read before xfrm override is created
                 orig_height = title_ph.height
@@ -374,7 +392,7 @@ def transfer(
                     # both into the text-safe band (0.92 .. 9.1in) as equal columns.
                     r1 = ph_map[1].left + ph_map[1].width
                     r2 = ph_map[2].left + ph_map[2].width
-                    if r1 > _BODY_SAFE_RIGHT or r2 > _BODY_SAFE_RIGHT:
+                    if wedge_template and (r1 > _BODY_SAFE_RIGHT or r2 > _BODY_SAFE_RIGHT):
                         col_w = (_BODY_SAFE_RIGHT - _BODY_SAFE_LEFT - _COL_GUTTER) // 2
                         _place_ph(ph_map[1], _BODY_SAFE_LEFT, col_w)
                         _place_ph(ph_map[2], _BODY_SAFE_LEFT + col_w + _COL_GUTTER, col_w)
@@ -388,7 +406,7 @@ def transfer(
                 else:
                     # BUG-2: single body column — clamp its right edge clear of the
                     # red wedge (only if it currently overruns it).
-                    if ph_map[1].left + ph_map[1].width > _BODY_SAFE_RIGHT:
+                    if wedge_template and ph_map[1].left + ph_map[1].width > _BODY_SAFE_RIGHT:
                         _place_ph(ph_map[1], ph_map[1].left, _BODY_SAFE_RIGHT - ph_map[1].left)
 
                     _fill_body(ph_map[1], _merge_boxes(body_text_boxes))
@@ -399,9 +417,11 @@ def transfer(
             # No body placeholder — add as floating text box
             try:
                 slide_h = dest_prs.slide_height
-                # BUG-2: keep the fallback textbox clear of the red wedge too.
+                # BUG-2: on a wedge template keep the fallback textbox clear of
+                # the red wedge; otherwise use (almost) the full slide width.
+                box_right = _BODY_SAFE_RIGHT if wedge_template else dest_prs.slide_width - Inches(0.5)
                 txBox = dest_slide.shapes.add_textbox(
-                    Inches(0.5), Inches(1.5), _BODY_SAFE_RIGHT - Inches(0.5), slide_h - Inches(2)
+                    Inches(0.5), Inches(1.5), box_right - Inches(0.5), slide_h - Inches(2)
                 )
                 all_paras = []
                 for i, box in enumerate(body_text_boxes):
