@@ -37,6 +37,10 @@ TEMP_DIR.mkdir(exist_ok=True)
 
 SAVED_TPL_PATH = Path(__file__).parent / "saved_template.pptx"
 SAVED_TPL_META = Path(__file__).parent / "saved_template.json"
+# Committed fallback so a fresh deploy always has a working template even though
+# Render's free tier has no persistent disk and wipes any user-saved one.
+DEFAULT_TPL_PATH = Path(__file__).parent / "default_template.pptx"
+DEFAULT_TPL_NAME = "CUCOM Template.pptx"
 
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 
@@ -145,6 +149,8 @@ async def template_info():
     if SAVED_TPL_PATH.exists():
         meta = json.loads(SAVED_TPL_META.read_text()) if SAVED_TPL_META.exists() else {}
         return {"saved": True, "filename": meta.get("filename", "template.pptx")}
+    if DEFAULT_TPL_PATH.exists():
+        return {"saved": True, "filename": DEFAULT_TPL_NAME, "default": True}
     return {"saved": False}
 
 
@@ -186,6 +192,8 @@ async def transfer_endpoint(
         _validate_pptx_bytes(template_bytes, "College template")
     elif SAVED_TPL_PATH.exists():
         template_bytes = SAVED_TPL_PATH.read_bytes()
+    elif DEFAULT_TPL_PATH.exists():
+        template_bytes = DEFAULT_TPL_PATH.read_bytes()
     else:
         raise HTTPException(400, "No template provided and no saved template found.")
 
