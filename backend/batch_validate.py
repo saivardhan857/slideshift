@@ -3,6 +3,9 @@
 Pairs each output with its source by chapter number, then QC-checks:
 missing slides, missing text, broken images, blank slides, wrong dimensions,
 corrupted ZIP structure, unsupported shapes carried from the source.
+
+Usage (arg order matches batch_convert.py):
+    python batch_validate.py [SOURCE_DIR] [TEMPLATE_PPTX] [OUTPUT_DIR]
 """
 
 import re
@@ -21,9 +24,9 @@ from pptx.util import Emu
 from parser import parse_source
 
 DESKTOP = Path.home() / "OneDrive" / "Desktop"
-SOURCE_DIR = DESKTOP / "Physiology"
-TEMPLATE = DESKTOP / "CUCOM Template.pptx"
-OUT_DIR = DESKTOP / "Physiology Converted"
+SOURCE_DIR = Path(sys.argv[1]) if len(sys.argv) > 1 else DESKTOP / "Physiology"
+TEMPLATE = Path(sys.argv[2]) if len(sys.argv) > 2 else DESKTOP / "CUCOM Template.pptx"
+OUT_DIR = Path(sys.argv[3]) if len(sys.argv) > 3 else DESKTOP / "Physiology Converted"
 
 A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
