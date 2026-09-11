@@ -226,14 +226,135 @@ def _write_paragraphs_to_tf(tf, paragraphs: list[Paragraph], clear_first=True):
                 r.text = para.full_text
 
 
+# --- Image / body-text collision avoidance -------------------------------- #
+#
+# A source picture with no destination picture placeholder lands at its own
+# (clamped-on-canvas) source coordinates. Canvas clamping only guarantees the
+# image stays on the slide — it says nothing about whether that spot is also
+# where the body placeholder now lives. An opaque screenshot dropped over the
+# body text hides it in the rendered output even though the text is still
+# present in the file (which is why the structural test suite didn't catch
+# this — it checks text/image survival, not on-slide position).
+#
+# Threshold measured from the real regression (Chapter 09 "The Blood" slide 5
+# on the CUCOM template): the screenshot covered 37% of its own area and 28%
+# of the body placeholder's area, and visibly hid two bullet lines. 15% is
+# comfortably below that real collision and above incidental edge contact
+# (a shape clipping a corner of the body box typically overlaps <5%).
+_COLLISION_THRESHOLD = 0.15
+
+
+def _rect_intersection_area(a, b):
+    """a, b = (left, top, width, height) in EMU. Overlap area, 0 if none."""
+    ax1, ay1, ax2, ay2 = a[0], a[1], a[0] + a[2], a[1] + a[3]
+    bx1, by1, bx2, by2 = b[0], b[1], b[0] + b[2], b[1] + b[3]
+    iw = min(ax2, bx2) - max(ax1, bx1)
+    ih = min(ay2, by2) - max(ay1, by1)
+    return max(0, iw) * max(0, ih)
+
+
+def _overlap_fraction(a, b):
+    """max(intersection / area_a, intersection / area_b), 0 if disjoint."""
+    area_a, area_b = a[2] * a[3], b[2] * b[3]
+    if area_a <= 0 or area_b <= 0:
+        return 0.0
+    inter = _rect_intersection_area(a, b)
+    return max(inter / area_a, inter / area_b) if inter > 0 else 0.0
+
+
+def _overlaps_meaningfully(a, b, threshold=_COLLISION_THRESHOLD):
+    """True once a and b share more than incidental edge contact."""
+    return _overlap_fraction(a, b) >= threshold
+
+
+def _clamp_rect(rect, slide_w, slide_h, margin):
+    left, top, w, h = rect
+    w = min(w, slide_w - 2 * margin)
+    h = min(h, slide_h - 2 * margin)
+    left = min(max(left, margin), slide_w - margin - w)
+    top = min(max(top, margin), slide_h - margin - h)
+    return (left, top, w, h)
+
+
+def _adjust_image_for_content_collision(rect, protected_rects, slide_w, slide_h):
+    """If `rect` (left, top, w, h EMU) meaningfully overlaps any protected
+    content region (a filled title/body placeholder or textbox), find a
+    placement that doesn't. Rects that don't collide come back unchanged —
+    this never moves an image that's already fine.
+
+    Least-destructive first: try moving (original size) into the open side of
+    whatever it collides with; if nothing clears it, shrink (aspect-preserving)
+    and retry; if it still can't fully clear protected content, keep the image
+    — never drop it — at whichever attempted placement minimized total
+    overlap.
+
+    Returns (new_rect, moved: bool, still_colliding: bool).
+    """
+    margin = Inches(0.1)
+    rect = _clamp_rect(rect, slide_w, slide_h, margin)
+    colliding = [p for p in protected_rects if _overlaps_meaningfully(rect, p)]
+    if not colliding:
+        return rect, False, False
+
+    left, top, w, h = rect
+    aspect = (w / h) if h else 1.0
+
+    def collides_any(r):
+        return any(_overlaps_meaningfully(r, p) for p in protected_rects)
+
+    def moves_for(cw, ch, base_left, base_top):
+        # Slide the image clear of each colliding region on whichever side
+        # (right/left/below/above it) has room, keeping the other axis put.
+        out = []
+        for (px, py, pw, ph_) in colliding:
+            out += [(px + pw + margin, base_top), (px - margin - cw, base_top),
+                    (base_left, py + ph_ + margin), (base_left, py - margin - ch)]
+        return out
+
+    tried = [rect]
+
+    # Attempt 1 — move only, original size; smallest displacement wins.
+    sized = [_clamp_rect((cl, ct, w, h), slide_w, slide_h, margin)
+             for cl, ct in moves_for(w, h, left, top)]
+    tried += sized
+    clear = [c for c in sized if not collides_any(c)]
+    if clear:
+        best = min(clear, key=lambda c: abs(c[0] - left) + abs(c[1] - top))
+        return best, True, False
+
+    # Attempt 2 — shrink (aspect-preserving), retry the same moves at each size.
+    scale = 1.0
+    min_side = min(Inches(0.6), slide_w, slide_h)
+    while True:
+        scale *= 0.85
+        nw, nh = int(w * scale), int(w * scale / aspect) if aspect else int(h * scale)
+        if nw < min_side or nh < min_side:
+            break
+        for cl, ct in [(left, top)] + moves_for(nw, nh, left, top):
+            cand = _clamp_rect((cl, ct, nw, nh), slide_w, slide_h, margin)
+            tried.append(cand)
+            if not collides_any(cand):
+                return cand, True, False
+
+    # Attempt 3 — best effort: keep the image, at whichever attempted
+    # placement left the least overlap with protected content.
+    best = min(tried, key=lambda c: sum(_overlap_fraction(c, p) for p in protected_rects))
+    return best, True, True
+
+
 def _add_image_to_slide(slide, img: ImageData, placeholder=None,
-                        slide_w=None, slide_h=None):
+                        slide_w=None, slide_h=None, protected_rects=None):
     """Add an image to a slide, fitting into placeholder bounds if given.
 
     With no destination placeholder the image is placed at its source
     coordinates/size. The source slide is often larger than this template's, so
     when slide_w/slide_h are supplied the image is scaled down and nudged to
-    stay fully on-canvas.
+    stay fully on-canvas — and, if `protected_rects` names the regions this
+    slide actually filled with title/body text, nudged clear of those too.
+
+    Returns (left, top, width, height, still_colliding) so the caller can
+    track this image as an obstacle for later ones and warn if it couldn't be
+    fully cleared.
     """
     if placeholder is not None:
         left = placeholder.left
@@ -254,6 +375,7 @@ def _add_image_to_slide(slide, img: ImageData, placeholder=None,
         width = int(src_w * ratio)
         height = int(src_h * ratio)
 
+    still_colliding = False
     if placeholder is None and slide_w and slide_h:
         margin = Inches(0.1)
         max_w, max_h = slide_w - 2 * margin, slide_h - 2 * margin
@@ -264,7 +386,13 @@ def _add_image_to_slide(slide, img: ImageData, placeholder=None,
         left = min(max(left, margin), slide_w - margin - width)
         top = min(max(top, margin), slide_h - margin - height)
 
+        if protected_rects:
+            (left, top, width, height), _moved, still_colliding = \
+                _adjust_image_for_content_collision(
+                    (left, top, width, height), protected_rects, slide_w, slide_h)
+
     slide.shapes.add_picture(img_stream, left, top, width, height)
+    return (left, top, width, height, still_colliding)
 
 
 def _add_table_to_slide(slide, tbl: TableData, placeholder=None,
@@ -354,6 +482,12 @@ def transfer(
         # Map placeholders by idx
         ph_map = {ph.placeholder_format.idx: ph for ph in dest_slide.placeholders}
 
+        # Regions this slide actually fills with title/body content — a
+        # free-floating source image must not be dropped on top of these.
+        # Populated as title/body get written below, in their final
+        # (post wedge-clamp) position; checked against when images are placed.
+        protected_rects = []
+
         # --- Transfer title ---
         if parsed.title and 0 in ph_map:
             title_ph = ph_map[0]
@@ -367,6 +501,7 @@ def transfer(
                 title_ph.width = max(orig_right - _TITLE_MIN_LEFT, Inches(4))
             try:
                 _write_paragraphs_to_tf(title_ph.text_frame, parsed.title.paragraphs)
+                protected_rects.append((title_ph.left, title_ph.top, title_ph.width, title_ph.height))
             except Exception as e:
                 result.errors.append(f"Title transfer failed: {e}")
         elif parsed.title and 0 not in ph_map:
@@ -377,6 +512,7 @@ def transfer(
                     Emu(0), Emu(0), slide_w, Pt(40).emu
                 )
                 _write_paragraphs_to_tf(txBox.text_frame, parsed.title.paragraphs)
+                protected_rects.append((txBox.left, txBox.top, txBox.width, txBox.height))
             except Exception as e:
                 result.errors.append(f"Title fallback failed: {e}")
 
@@ -441,6 +577,8 @@ def transfer(
                     # (post-split, post-BUG-2-clamp) dimensions.
                     _fill_body(ph_map[1], _merge_boxes(left))
                     _fill_body(ph_map[2], _merge_boxes(right))
+                    protected_rects.append((ph_map[1].left, ph_map[1].top, ph_map[1].width, ph_map[1].height))
+                    protected_rects.append((ph_map[2].left, ph_map[2].top, ph_map[2].width, ph_map[2].height))
                 else:
                     # BUG-2: single body column — clamp its right edge clear of the
                     # red wedge (only if it currently overruns it).
@@ -448,6 +586,7 @@ def transfer(
                         _place_ph(ph_map[1], ph_map[1].left, _BODY_SAFE_RIGHT - ph_map[1].left)
 
                     _fill_body(ph_map[1], _merge_boxes(body_text_boxes))
+                    protected_rects.append((ph_map[1].left, ph_map[1].top, ph_map[1].width, ph_map[1].height))
             except Exception as e:
                 result.errors.append(f"Body transfer failed: {e}")
 
@@ -468,10 +607,15 @@ def transfer(
                         all_paras.append(Para(runs=[TR(text="")]))
                     all_paras.extend(box.paragraphs)
                 _write_paragraphs_to_tf(txBox.text_frame, all_paras)
+                protected_rects.append((txBox.left, txBox.top, txBox.width, txBox.height))
             except Exception as e:
                 result.errors.append(f"Body fallback failed: {e}")
 
         # --- Transfer images ---
+        # Previously-placed free-floating images join protected_rects as we go,
+        # so a second image on the same slide doesn't land on the first one
+        # (still just bounding-box avoidance — no packing engine).
+        placed_image_rects = []
         for img in parsed.images:
             try:
                 # Look for picture placeholder (idx >= 2 typically)
@@ -482,9 +626,15 @@ def transfer(
                     ):
                         img_ph = ph
                         break
-                _add_image_to_slide(dest_slide, img, placeholder=img_ph,
-                                    slide_w=dest_prs.slide_width,
-                                    slide_h=dest_prs.slide_height)
+                left, top, width, height, still_colliding = _add_image_to_slide(
+                    dest_slide, img, placeholder=img_ph,
+                    slide_w=dest_prs.slide_width, slide_h=dest_prs.slide_height,
+                    protected_rects=protected_rects + placed_image_rects)
+                placed_image_rects.append((left, top, width, height))
+                if still_colliding:
+                    result.warnings.append(
+                        f"⚠ Slide {parsed.index + 1} — an image could not be fully "
+                        f"repositioned clear of the body text; some overlap remains.")
             except Exception as e:
                 result.warnings.append(f"Image on slide {parsed.index + 1} could not be transferred: {e}")
 
