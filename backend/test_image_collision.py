@@ -235,4 +235,5 @@ if default_tpl.exists():
 
 
 print(f"\nimage/body collision: {'all passed' if not fails else f'{fails} FAILED'}")
-raise SystemExit(1 if fails else 0)
+if __name__ == "__main__":
+    raise SystemExit(1 if fails else 0)

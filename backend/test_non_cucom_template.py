@@ -113,4 +113,5 @@ overflow = [(sh.shape_type, round(Emu(sh.left).inches, 2), round(Emu(sh.width).i
 check(f"no shape off the narrow canvas (got {overflow})", not overflow)
 
 print(f"\nnon-CUCOM template: {'all passed' if not fails else f'{fails} FAILED'}")
-raise SystemExit(1 if fails else 0)
+if __name__ == "__main__":
+    raise SystemExit(1 if fails else 0)
