@@ -54,6 +54,22 @@ _BODY_SAFE_LEFT = Inches(0.92)    # CUCOM title/body left edge
 _BODY_SAFE_RIGHT = Inches(9.1)
 _COL_GUTTER = Inches(0.3)
 
+# Placeholder types, keyed by python-pptx's actual str(placeholder_format.type)
+# repr — "NAME (value)" with a space before the parenthesis.
+#
+# PICTURE/MEDIA_CLIP/CHART/TABLE are type-locked: they can never hold typed
+# bullet text. OBJECT is PowerPoint's generic "click an icon for a picture/
+# chart/table, or just type" content placeholder — it's the sole content slot
+# on the very common single-placeholder "Title and Content" layout, where it
+# must stay eligible for body text. But a layout like "Content with Caption"
+# pairs an OBJECT placeholder (the big picture area) with a separate, real
+# BODY placeholder (the caption) — there, OBJECT is clearly the picture's
+# slot and text must go in BODY instead, or the two end up stacked on top of
+# each other (they're differently sized/positioned, not parallel columns).
+# So OBJECT only counts as "text-capable" when no sibling BODY exists.
+_STRICT_MEDIA_PH_TYPES = ("PICTURE (18)", "MEDIA_CLIP (10)", "CHART (8)", "TABLE (12)")
+_MEDIA_PH_TYPES = _STRICT_MEDIA_PH_TYPES + ("OBJECT (7)",)  # types that can hold an image
+
 
 def _place_ph(ph, left, width):
     """Reposition a placeholder while preserving its inherited top/height.
@@ -519,6 +535,20 @@ def transfer(
         # --- Transfer body text ---
         body_text_boxes = [b for b in parsed.body_boxes if b.full_text.strip()]
 
+        # Placeholders that can actually take flowing bullet text: not the
+        # title, never a type-locked media slot, and OBJECT only when there's
+        # no sibling BODY placeholder claiming the real text role instead
+        # (see _MEDIA_PH_TYPES/_STRICT_MEDIA_PH_TYPES above).
+        has_real_body = any(str(ph.placeholder_format.type) == "BODY (2)"
+                             for idx, ph in ph_map.items() if idx != 0)
+        body_ph_items = [
+            (idx, ph_map[idx]) for idx in sorted(ph_map) if idx != 0
+            and str(ph_map[idx].placeholder_format.type) not in _STRICT_MEDIA_PH_TYPES
+            and not (str(ph_map[idx].placeholder_format.type) == "OBJECT (7)" and has_real_body)
+        ]
+        body_phs = [ph for _, ph in body_ph_items]
+        claimed_ph_indices = set()
+
         def _merge_boxes(boxes):
             from parser import Paragraph as Para, TextRun as TR
             merged = []
@@ -556,41 +586,45 @@ def transfer(
                 result.warnings.append(f"⚠ Slide {parsed.index + 1} — {plan.warning}.")
             return plan
 
-        if body_text_boxes and 1 in ph_map:
+        if body_text_boxes and body_phs:
             try:
-                # Two-column source + a layout that actually has a 2nd content
+                # Two-column source + a layout that actually has a 2nd text
                 # placeholder → spread the boxes across both columns instead of
                 # stacking them all in the (often half-width) first one.
-                if len(body_text_boxes) >= 2 and 2 in ph_map:
+                if len(body_text_boxes) >= 2 and len(body_phs) >= 2:
+                    col1, col2 = body_phs[0], body_phs[1]
+                    claimed_ph_indices.update((body_ph_items[0][0], body_ph_items[1][0]))
                     # BUG-2: if either column reaches into the red wedge, rebalance
                     # both into the text-safe band (0.92 .. 9.1in) as equal columns.
-                    r1 = ph_map[1].left + ph_map[1].width
-                    r2 = ph_map[2].left + ph_map[2].width
+                    r1 = col1.left + col1.width
+                    r2 = col2.left + col2.width
                     if wedge_template and (r1 > _BODY_SAFE_RIGHT or r2 > _BODY_SAFE_RIGHT):
                         col_w = (_BODY_SAFE_RIGHT - _BODY_SAFE_LEFT - _COL_GUTTER) // 2
-                        _place_ph(ph_map[1], _BODY_SAFE_LEFT, col_w)
-                        _place_ph(ph_map[2], _BODY_SAFE_LEFT + col_w + _COL_GUTTER, col_w)
+                        _place_ph(col1, _BODY_SAFE_LEFT, col_w)
+                        _place_ph(col2, _BODY_SAFE_LEFT + col_w + _COL_GUTTER, col_w)
 
                     mid = (len(body_text_boxes) + 1) // 2
                     left, right = body_text_boxes[:mid], body_text_boxes[mid:]
                     # Each column is fitted independently against its own
                     # (post-split, post-BUG-2-clamp) dimensions.
-                    _fill_body(ph_map[1], _merge_boxes(left))
-                    _fill_body(ph_map[2], _merge_boxes(right))
-                    protected_rects.append((ph_map[1].left, ph_map[1].top, ph_map[1].width, ph_map[1].height))
-                    protected_rects.append((ph_map[2].left, ph_map[2].top, ph_map[2].width, ph_map[2].height))
+                    _fill_body(col1, _merge_boxes(left))
+                    _fill_body(col2, _merge_boxes(right))
+                    protected_rects.append((col1.left, col1.top, col1.width, col1.height))
+                    protected_rects.append((col2.left, col2.top, col2.width, col2.height))
                 else:
+                    col1 = body_phs[0]
+                    claimed_ph_indices.add(body_ph_items[0][0])
                     # BUG-2: single body column — clamp its right edge clear of the
                     # red wedge (only if it currently overruns it).
-                    if wedge_template and ph_map[1].left + ph_map[1].width > _BODY_SAFE_RIGHT:
-                        _place_ph(ph_map[1], ph_map[1].left, _BODY_SAFE_RIGHT - ph_map[1].left)
+                    if wedge_template and col1.left + col1.width > _BODY_SAFE_RIGHT:
+                        _place_ph(col1, col1.left, _BODY_SAFE_RIGHT - col1.left)
 
-                    _fill_body(ph_map[1], _merge_boxes(body_text_boxes))
-                    protected_rects.append((ph_map[1].left, ph_map[1].top, ph_map[1].width, ph_map[1].height))
+                    _fill_body(col1, _merge_boxes(body_text_boxes))
+                    protected_rects.append((col1.left, col1.top, col1.width, col1.height))
             except Exception as e:
                 result.errors.append(f"Body transfer failed: {e}")
 
-        elif body_text_boxes and 1 not in ph_map:
+        elif body_text_boxes and not body_phs:
             # No body placeholder — add as floating text box
             try:
                 slide_h = dest_prs.slide_height
@@ -616,15 +650,15 @@ def transfer(
         # so a second image on the same slide doesn't land on the first one
         # (still just bounding-box avoidance — no packing engine).
         placed_image_rects = []
+        used_media_ph_indices = set(claimed_ph_indices)  # don't double-book a placeholder already filled with text
         for img in parsed.images:
             try:
-                # Look for picture placeholder (idx >= 2 typically)
+                # Look for an unclaimed picture/media/object placeholder.
                 img_ph = None
                 for idx, ph in ph_map.items():
-                    if idx >= 2 and str(ph.placeholder_format.type) in (
-                        "PICTURE(18)", "OBJECT(14)", "MEDIA(16)"
-                    ):
+                    if idx not in used_media_ph_indices and str(ph.placeholder_format.type) in _MEDIA_PH_TYPES:
                         img_ph = ph
+                        used_media_ph_indices.add(idx)
                         break
                 left, top, width, height, still_colliding = _add_image_to_slide(
                     dest_slide, img, placeholder=img_ph,
