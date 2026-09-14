@@ -22,6 +22,7 @@ from parser import parse_source
 from transfer import transfer
 from validator import validate
 from diagnostics import build_diagnostics
+from ai_classify import classify_titles
 
 logger = logging.getLogger("slideshift")
 logger.setLevel(logging.INFO)
@@ -244,6 +245,9 @@ async def transfer_endpoint(
 
     async def run_transfer():
         try:
+            await queue.put({"type": "progress", "step": "classifying"})
+            await loop.run_in_executor(None, lambda: classify_titles(source_slides))
+
             t0 = time.monotonic()
             results = await loop.run_in_executor(
                 None,

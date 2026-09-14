@@ -10,6 +10,7 @@ from pptx.util import Emu, Pt, Inches
 from pptx.dml.color import RGBColor
 from pptx.enum.text import MSO_AUTO_SIZE
 from pptx.oxml.ns import qn as _qn
+from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 
 def _dedupe_pptx(path: str):
@@ -157,11 +158,16 @@ def _has_fullbleed_bg(design_images, slide_w, slide_h):
 
 
 def _add_background_images(dest_slide, design_images):
-    """Inject background images behind all slide content."""
+    """Inject background images behind all slide content. Returns the
+    shape_ids of the images it added, so callers can tell decoration apart
+    from actual transferred content (a decorative image is expected to sit
+    behind everything — a small corner logo included — and isn't a
+    candidate for the overlap audit the way a real content image is)."""
     spTree = dest_slide.element.find(f'{{{_NS_P}}}cSld/{{{_NS_P}}}spTree')
     if spTree is None:
-        return
+        return []
     insert_idx = 2  # after nvGrpSpPr and grpSpPr
+    shape_ids = []
     for blob, left, top, width, height in design_images:
         try:
             pic = dest_slide.shapes.add_picture(io.BytesIO(blob), left, top, width, height)
@@ -169,8 +175,10 @@ def _add_background_images(dest_slide, design_images):
             spTree.remove(el)
             spTree.insert(insert_idx, el)
             insert_idx += 1
+            shape_ids.append(pic.shape_id)
         except Exception:
             pass
+    return shape_ids
 
 
 class TransferResult:
@@ -281,6 +289,47 @@ def _overlap_fraction(a, b):
 def _overlaps_meaningfully(a, b, threshold=_COLLISION_THRESHOLD):
     """True once a and b share more than incidental edge contact."""
     return _overlap_fraction(a, b) >= threshold
+
+
+def _find_slide_overlaps(dest_slide, slide_w, slide_h, background_shape_ids=()):
+    """Generic end-of-slide audit: do any two placed elements (title, body,
+    floating textbox, image, table) meaningfully overlap?
+
+    This exists because per-content-type placement code (title vs. body vs.
+    image) only ever checks the NEW element against what came before it --
+    there was no single point that looked at the finished slide as a whole.
+    A geometry mismatch between two placeholders used as parallel text
+    columns (see the OBJECT/BODY placeholder-role fix) produced exactly this:
+    text overlapping text, invisible to any single per-element check.
+
+    background_shape_ids (from _add_background_images) are excluded outright
+    -- template decoration is expected to sit behind, and be covered by,
+    real content, whatever its size (a small corner logo counts just as much
+    as CUCOM's full-bleed wedge art). Returns a list of short description
+    strings, one per offending pair.
+    """
+    rects = []
+    for sh in dest_slide.shapes:
+        if sh.shape_id in background_shape_ids:
+            continue
+        if sh.left is None or sh.top is None or sh.width is None or sh.height is None:
+            continue
+        rect = (sh.left, sh.top, sh.width, sh.height)
+        if sh.has_text_frame and sh.text_frame.text.strip():
+            rects.append(("text", rect))
+        elif sh.has_table:
+            rects.append(("table", rect))
+        elif sh.shape_type == MSO_SHAPE_TYPE.PICTURE:
+            rects.append(("image", rect))
+
+    conflicts = []
+    for i in range(len(rects)):
+        for j in range(i + 1, len(rects)):
+            kind_a, rect_a = rects[i]
+            kind_b, rect_b = rects[j]
+            if _overlaps_meaningfully(rect_a, rect_b):
+                conflicts.append(f"{kind_a} overlaps {kind_b}")
+    return conflicts
 
 
 def _clamp_rect(rect, slide_w, slide_h, margin):
@@ -493,7 +542,7 @@ def transfer(
         best_layout = find_best_layout(slide_type, template_layouts)
         dest_layout = dest_prs.slide_layouts[best_layout.index]
         dest_slide = dest_prs.slides.add_slide(dest_layout)
-        _add_background_images(dest_slide, design_images)
+        background_shape_ids = _add_background_images(dest_slide, design_images)
 
         # Map placeholders by idx
         ph_map = {ph.placeholder_format.idx: ph for ph in dest_slide.placeholders}
@@ -744,6 +793,13 @@ def transfer(
                     f"transferred automatically — recreate manually.]")
             except Exception:
                 pass
+
+        overlaps = _find_slide_overlaps(dest_slide, dest_prs.slide_width, dest_prs.slide_height,
+                                         background_shape_ids)
+        if overlaps:
+            result.warnings.append(
+                f"⚠ Slide {parsed.index + 1} — layout conflict: {overlaps[0]} "
+                f"(possible overlapping content).")
 
         results.append(result)
 
