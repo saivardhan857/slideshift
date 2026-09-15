@@ -23,6 +23,7 @@ from transfer import transfer
 from validator import validate
 from diagnostics import build_diagnostics
 from ai_classify import classify_titles
+from mcp_integration.server import build_mcp_app
 
 logger = logging.getLogger("slideshift")
 logger.setLevel(logging.INFO)
@@ -58,7 +59,15 @@ _JOB_TTL_SAFETY_NET = 1800                  # hard upper bound for any job direc
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _sweep_temp()
-    yield
+    # _mcp_session_manager is assigned below, right after `app` is built --
+    # by the time this actually runs (server startup) the module has fully
+    # loaded. If MCP fails to start, the rest of the app must still work.
+    try:
+        async with _mcp_session_manager.run():
+            yield
+    except Exception:
+        logger.exception("MCP session manager failed to start; /mcp will be unavailable")
+        yield
     _sweep_temp()
 
 
@@ -79,6 +88,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# --------------------------------------------------------------------------- #
+# MCP interface (additive; talks to the routes below over an in-process ASGI
+# transport, exactly like a real HTTP client -- see docs/MCP.md)
+# --------------------------------------------------------------------------- #
+_mcp_session_manager = build_mcp_app(app)
 
 
 # --------------------------------------------------------------------------- #
