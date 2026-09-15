@@ -4,7 +4,7 @@ The regex/position heuristic in parser.py gets this wrong on real decks --
 e.g. a body sentence fragment ("Articular surface the head of the femur,")
 promoted to the slide title just because it's short and sits near the top.
 This module sends the heuristic's existing title/body split for the whole
-deck to Claude in one batched call and lets it correct mistakes.
+deck to Gemini in one batched call and lets it correct mistakes.
 
 No API key, any network failure, a timeout, or a malformed response all fall
 back to the heuristic's existing (unmodified) result -- this must never
@@ -18,9 +18,8 @@ import urllib.request
 
 logger = logging.getLogger("slideshift")
 
-_API_URL = "https://api.anthropic.com/v1/messages"
-_MODEL = "claude-haiku-4-5-20251001"  # plain classification task -- no need for a bigger model
-_ANTHROPIC_VERSION = "2023-06-01"
+_MODEL = "gemini-2.0-flash"  # plain classification task -- no need for a bigger model
+_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{_MODEL}:generateContent"
 
 _SYSTEM_PROMPT = (
     "You are reviewing text fragments extracted from lecture slides. Each "
@@ -87,10 +86,10 @@ def _apply_roles(slides, role_map):
 
 
 def classify_titles(slides, timeout: float = 15.0) -> bool:
-    """Ask Claude to correct parser.py's title/body split for this deck.
+    """Ask Gemini to correct parser.py's title/body split for this deck.
     Returns True if AI classification was applied, False if it fell back to
     the heuristic's existing result (no key, request failed, bad response)."""
-    api_key = os.getenv("ANTHROPIC_API_KEY")
+    api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         return False
 
@@ -100,23 +99,21 @@ def classify_titles(slides, timeout: float = 15.0) -> bool:
 
     try:
         body = json.dumps({
-            "model": _MODEL,
-            "max_tokens": 4096,
-            "system": _SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": json.dumps(payload)}],
+            "systemInstruction": {"parts": [{"text": _SYSTEM_PROMPT}]},
+            "contents": [{"parts": [{"text": json.dumps(payload)}]}],
+            "generationConfig": {"maxOutputTokens": 4096, "responseMimeType": "application/json"},
         }).encode("utf-8")
         req = urllib.request.Request(
             _API_URL, data=body, method="POST",
             headers={
-                "x-api-key": api_key,
-                "anthropic-version": _ANTHROPIC_VERSION,
+                "x-goog-api-key": api_key,
                 "content-type": "application/json",
             },
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             response = json.loads(resp.read().decode("utf-8"))
 
-        text = response["content"][0]["text"]
+        text = response["candidates"][0]["content"]["parts"][0]["text"]
         roles = json.loads(text)
         role_map = {
             (int(r["slide"]), int(r["fragment"])): r["role"]

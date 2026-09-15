@@ -53,7 +53,7 @@ def _fake_response(payload_bytes):
 # --------------------------------------------------------------------------- #
 slides1 = [_mk_slide(0, "Misdetected title fragment", ["Real body one", "Real body two"])]
 with patch.dict(os.environ, {}, clear=False):
-    os.environ.pop("ANTHROPIC_API_KEY", None)
+    os.environ.pop("GEMINI_API_KEY", None)
     applied1 = classify_titles(slides1)
 check("Test1: no key -> returns False", applied1 is False)
 check("Test1: no key -> title untouched",
@@ -66,9 +66,11 @@ check("Test1: no key -> body untouched", len(slides1[0].body_boxes) == 2)
 # --------------------------------------------------------------------------- #
 slides2 = [_mk_slide(0, "Misdetected title fragment", ["Real body one", "Real body two"])]
 fake_roles = [{"slide": 0, "fragment": 0, "role": "body"}]
-fake_api_response = json.dumps({"content": [{"type": "text", "text": json.dumps(fake_roles)}]}).encode()
+fake_api_response = json.dumps({
+    "candidates": [{"content": {"parts": [{"text": json.dumps(fake_roles)}]}}]
+}).encode()
 
-with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
     with patch("urllib.request.urlopen", return_value=_fake_response(fake_api_response).__enter__()):
         applied2 = classify_titles(slides2)
 
@@ -84,9 +86,11 @@ check("Test2: demoted fragment lands FIRST, original body order preserved after 
 # original heuristic result untouched.
 # --------------------------------------------------------------------------- #
 slides3 = [_mk_slide(0, "Some title", ["Some body"])]
-garbage_response = json.dumps({"content": [{"type": "text", "text": "not valid json {{{"}]}).encode()
+garbage_response = json.dumps({
+    "candidates": [{"content": {"parts": [{"text": "not valid json {{{"}]}}]
+}).encode()
 
-with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
+with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
     with patch("urllib.request.urlopen", return_value=_fake_response(garbage_response).__enter__()):
         applied3 = classify_titles(slides3)
 
