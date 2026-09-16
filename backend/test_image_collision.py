@@ -80,15 +80,26 @@ adjusted2, moved2, _ = _adjust_image_for_content_collision(far_image, [body], SL
 check("Test2: non-overlapping image left untouched", adjusted2 == far_image and not moved2, adjusted2)
 
 # --------------------------------------------------------------------------- #
-# Test 3 — image barely touches the body's edge -> below threshold, unchanged
+# Test 3 — a real deck (Joints of Lower limb.pptx, Sep 15 sweep) showed images
+# sitting at 10-14% overlap on 12/14 slides: clearly visible in practice, but
+# under the old 15% QA-audit threshold, so avoidance never triggered. The
+# active avoidance threshold is now a separate, lower constant (5%) -- the
+# QA-audit threshold stays at 15% (see _find_slide_overlaps), since that one
+# governs "does this need a human to look at it", not "can we just fix it".
 # --------------------------------------------------------------------------- #
-# A wide banner whose bottom edge only grazes the top of the body box: most of
-# the image and most of the body are untouched by each other.
-edge_image = (Inches(4.5), Inches(0.5), Inches(6), Inches(0.6))
-frac = _overlap_fraction(edge_image, body)
-check("Test3: edge contact is below the collision threshold", frac < 0.15, frac)
-adjusted3, moved3, _ = _adjust_image_for_content_collision(edge_image, [body], SLIDE_W, SLIDE_H)
-check("Test3: edge-touch image left untouched", adjusted3 == edge_image and not moved3, adjusted3)
+grazing_image = (Inches(4.5), Inches(0.5), Inches(6), Inches(0.6))
+frac_grazing = _overlap_fraction(grazing_image, body)
+check("Test3: grazing overlap is the real-world 10-15% range", 0.05 < frac_grazing < 0.15, frac_grazing)
+adjusted3, moved3, _ = _adjust_image_for_content_collision(grazing_image, [body], SLIDE_W, SLIDE_H)
+check("Test3: grazing overlap now gets resolved (moved)", not overlaps(adjusted3, [body]) and moved3, adjusted3)
+
+# Genuinely incidental corner contact (a sliver, not a graze) must still be
+# left alone -- the avoidance logic shouldn't fire on noise.
+corner_image = (Inches(8.5), Inches(0.5), Inches(2), Inches(0.6))
+frac_corner = _overlap_fraction(corner_image, body)
+check("Test3: corner-clip overlap is below the avoidance threshold", frac_corner < 0.05, frac_corner)
+adjusted3b, moved3b, _ = _adjust_image_for_content_collision(corner_image, [body], SLIDE_W, SLIDE_H)
+check("Test3: incidental corner-clip left untouched", adjusted3b == corner_image and not moved3b, adjusted3b)
 
 # --------------------------------------------------------------------------- #
 # Test 4 — image can't move clear without leaving the slide -> scaled instead

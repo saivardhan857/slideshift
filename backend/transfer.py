@@ -264,8 +264,17 @@ def _write_paragraphs_to_tf(tf, paragraphs: list[Paragraph], clear_first=True):
 # on the CUCOM template): the screenshot covered 37% of its own area and 28%
 # of the body placeholder's area, and visibly hid two bullet lines. 15% is
 # comfortably below that real collision and above incidental edge contact
-# (a shape clipping a corner of the body box typically overlaps <5%).
+# (a shape clipping a corner of the body box typically overlaps <5%). Used by
+# the end-of-slide QA audit (_find_slide_overlaps) -- deliberately lenient so
+# incidental corner contact doesn't flag every slide as "needs review".
 _COLLISION_THRESHOLD = 0.15
+
+# _adjust_image_for_content_collision actively fixes what it detects (move,
+# then shrink) rather than just warning, so there's no cost to catching more:
+# a real deck (Joints of Lower limb.pptx, Sep 15 sweep) showed images sitting
+# at 10-14% overlap on 12/14 slides -- clearly visible, but under 15% so the
+# repositioning logic never ran. Lower threshold, same avoidance logic.
+_IMAGE_COLLISION_AVOIDANCE_THRESHOLD = 0.05
 
 
 def _rect_intersection_area(a, b):
@@ -357,7 +366,8 @@ def _adjust_image_for_content_collision(rect, protected_rects, slide_w, slide_h)
     """
     margin = Inches(0.1)
     rect = _clamp_rect(rect, slide_w, slide_h, margin)
-    colliding = [p for p in protected_rects if _overlaps_meaningfully(rect, p)]
+    colliding = [p for p in protected_rects
+                 if _overlaps_meaningfully(rect, p, _IMAGE_COLLISION_AVOIDANCE_THRESHOLD)]
     if not colliding:
         return rect, False, False
 
@@ -365,7 +375,8 @@ def _adjust_image_for_content_collision(rect, protected_rects, slide_w, slide_h)
     aspect = (w / h) if h else 1.0
 
     def collides_any(r):
-        return any(_overlaps_meaningfully(r, p) for p in protected_rects)
+        return any(_overlaps_meaningfully(r, p, _IMAGE_COLLISION_AVOIDANCE_THRESHOLD)
+                   for p in protected_rects)
 
     def moves_for(cw, ch, base_left, base_top):
         # Slide the image clear of each colliding region on whichever side
