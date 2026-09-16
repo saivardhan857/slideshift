@@ -18,7 +18,10 @@ import urllib.request
 
 logger = logging.getLogger("slideshift")
 
-_MODEL = "gemini-3.6-flash"  # plain classification task -- no need for a bigger model
+_MODEL = "gemini-flash-latest"  # Google's own stable alias -- avoids hardcoding a
+                                 # specific dated version that gets retired/unstable
+                                 # (gemini-2.0-flash was retired, then gemini-3.6-flash
+                                 # showed intermittent 400/503 errors under real load)
 _API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{_MODEL}:generateContent"
 
 _SYSTEM_PROMPT = (
