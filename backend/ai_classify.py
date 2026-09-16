@@ -85,7 +85,7 @@ def _apply_roles(slides, role_map):
         s.body_boxes = [tb for idx, tb, _role in roles if idx != new_title_idx]
 
 
-def classify_titles(slides, timeout: float = 15.0) -> bool:
+def classify_titles(slides, timeout: float = 45.0) -> bool:
     """Ask Gemini to correct parser.py's title/body split for this deck.
     Returns True if AI classification was applied, False if it fell back to
     the heuristic's existing result (no key, request failed, bad response)."""
