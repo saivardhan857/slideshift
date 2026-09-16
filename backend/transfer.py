@@ -453,6 +453,10 @@ def _add_image_to_slide(slide, img: ImageData, placeholder=None,
 
     still_colliding = False
     if placeholder is None and slide_w and slide_h:
+        # A free-floating image landed at its own source coordinates, which
+        # may exceed a smaller destination canvas -- clamp/scale onto it.
+        # A placeholder's geometry is already on-canvas by construction, so
+        # this step is free-floating-only.
         margin = Inches(0.1)
         max_w, max_h = slide_w - 2 * margin, slide_h - 2 * margin
         if width > max_w or height > max_h:
@@ -462,10 +466,15 @@ def _add_image_to_slide(slide, img: ImageData, placeholder=None,
         left = min(max(left, margin), slide_w - margin - width)
         top = min(max(top, margin), slide_h - margin - height)
 
-        if protected_rects:
-            (left, top, width, height), _moved, still_colliding = \
-                _adjust_image_for_content_collision(
-                    (left, top, width, height), protected_rects, slide_w, slide_h)
+    # Collision avoidance applies either way: a placeholder's position comes
+    # from the template's layout, which can still collide with THIS slide's
+    # actual (post-fit) title/body text -- e.g. a picture placeholder whose
+    # box happens to graze the title on some layouts. The template's slot
+    # is a starting position, not a guarantee against this specific content.
+    if slide_w and slide_h and protected_rects:
+        (left, top, width, height), _moved, still_colliding = \
+            _adjust_image_for_content_collision(
+                (left, top, width, height), protected_rects, slide_w, slide_h)
 
     slide.shapes.add_picture(img_stream, left, top, width, height)
     return (left, top, width, height, still_colliding)
