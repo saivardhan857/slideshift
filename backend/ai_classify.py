@@ -18,7 +18,7 @@ import urllib.request
 
 logger = logging.getLogger("slideshift")
 
-_MODEL = "gemini-2.0-flash"  # plain classification task -- no need for a bigger model
+_MODEL = "gemini-3.6-flash"  # plain classification task -- no need for a bigger model
 _API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{_MODEL}:generateContent"
 
 _SYSTEM_PROMPT = (
