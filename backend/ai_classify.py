@@ -13,10 +13,18 @@ block or break a conversion. classify_titles() never raises.
 import json
 import logging
 import os
+import time
 import urllib.error
 import urllib.request
 
 logger = logging.getLogger("slideshift")
+
+_MAX_ATTEMPTS = 2       # one retry -- Google's flash-tier models see transient
+                        # 5xx/timeout under real load; a second try clears most
+_RETRY_DELAY_SECONDS = 2.0
+# 4xx codes are the caller's fault (bad key, bad request shape) -- retrying an
+# identical request won't change the outcome, so only retry server-side/transient.
+_RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
 
 _MODEL = "gemini-flash-latest"  # Google's own stable alias -- avoids hardcoding a
                                  # specific dated version that gets retired/unstable
@@ -100,42 +108,54 @@ def classify_titles(slides, timeout: float = 45.0) -> bool:
     if not payload:
         return False
 
-    try:
-        body = json.dumps({
-            "systemInstruction": {"parts": [{"text": _SYSTEM_PROMPT}]},
-            "contents": [{"parts": [{"text": json.dumps(payload)}]}],
-            "generationConfig": {"maxOutputTokens": 4096, "responseMimeType": "application/json"},
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            _API_URL, data=body, method="POST",
-            headers={
-                "x-goog-api-key": api_key,
-                "content-type": "application/json",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            response = json.loads(resp.read().decode("utf-8"))
+    body = json.dumps({
+        "systemInstruction": {"parts": [{"text": _SYSTEM_PROMPT}]},
+        "contents": [{"parts": [{"text": json.dumps(payload)}]}],
+        "generationConfig": {"maxOutputTokens": 4096, "responseMimeType": "application/json"},
+    }).encode("utf-8")
 
-        text = response["candidates"][0]["content"]["parts"][0]["text"]
-        roles = json.loads(text)
-        role_map = {
-            (int(r["slide"]), int(r["fragment"])): r["role"]
-            for r in roles if r.get("role") in ("title", "body")
-        }
-        if not role_map:
-            return False
-
-        _apply_roles(slides, role_map)
-        return True
-    except urllib.error.HTTPError as e:
-        # Google's error body is diagnostic text (e.g. "API_KEY_INVALID",
-        # "PERMISSION_DENIED") -- never the key itself -- safe to log.
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
         try:
-            detail = e.read().decode("utf-8", errors="replace")[:300]
-        except Exception:
-            detail = ""
-        logger.warning("AI title classification skipped (HTTPError %s): %s", e.code, detail)
-        return False
-    except Exception as e:
-        logger.warning("AI title classification skipped (%s)", type(e).__name__)
-        return False
+            req = urllib.request.Request(
+                _API_URL, data=body, method="POST",
+                headers={
+                    "x-goog-api-key": api_key,
+                    "content-type": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                response = json.loads(resp.read().decode("utf-8"))
+
+            text = response["candidates"][0]["content"]["parts"][0]["text"]
+            roles = json.loads(text)
+            role_map = {
+                (int(r["slide"]), int(r["fragment"])): r["role"]
+                for r in roles if r.get("role") in ("title", "body")
+            }
+            if not role_map:
+                return False
+
+            _apply_roles(slides, role_map)
+            return True
+        except urllib.error.HTTPError as e:
+            # Google's error body is diagnostic text (e.g. "API_KEY_INVALID",
+            # "PERMISSION_DENIED") -- never the key itself -- safe to log.
+            try:
+                detail = e.read().decode("utf-8", errors="replace")[:300]
+            except Exception:
+                detail = ""
+            logger.warning(
+                "AI title classification attempt %d/%d failed (HTTPError %s): %s",
+                attempt, _MAX_ATTEMPTS, e.code, detail,
+            )
+            if e.code not in _RETRYABLE_HTTP_CODES or attempt == _MAX_ATTEMPTS:
+                return False
+        except Exception as e:
+            logger.warning(
+                "AI title classification attempt %d/%d failed (%s)",
+                attempt, _MAX_ATTEMPTS, type(e).__name__,
+            )
+            if attempt == _MAX_ATTEMPTS:
+                return False
+        time.sleep(_RETRY_DELAY_SECONDS)
+    return False
