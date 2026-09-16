@@ -124,6 +124,15 @@ def classify_titles(slides, timeout: float = 15.0) -> bool:
 
         _apply_roles(slides, role_map)
         return True
+    except urllib.error.HTTPError as e:
+        # Google's error body is diagnostic text (e.g. "API_KEY_INVALID",
+        # "PERMISSION_DENIED") -- never the key itself -- safe to log.
+        try:
+            detail = e.read().decode("utf-8", errors="replace")[:300]
+        except Exception:
+            detail = ""
+        logger.warning("AI title classification skipped (HTTPError %s): %s", e.code, detail)
+        return False
     except Exception as e:
         logger.warning("AI title classification skipped (%s)", type(e).__name__)
         return False
