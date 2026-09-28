@@ -42,7 +42,7 @@ SAVED_TPL_META = Path(__file__).parent / "saved_template.json"
 # Committed fallback so a fresh deploy always has a working template even though
 # Render's free tier has no persistent disk and wipes any user-saved one.
 DEFAULT_TPL_PATH = Path(__file__).parent / "default_template.pptx"
-DEFAULT_TPL_NAME = "CUCOM Template.pptx"
+DEFAULT_TPL_NAME = "CUCOM_Presentation_Template.pptx"
 
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 
