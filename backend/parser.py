@@ -1,5 +1,6 @@
 """Parse source PPTX into a structured representation."""
 
+import copy
 import re
 from dataclasses import dataclass, field
 from typing import Optional
@@ -32,12 +33,22 @@ class TextRun:
     font_size: Optional[float] = None
     font_color: Optional[str] = None  # hex string
     font_name: Optional[str] = None
+    baseline: Optional[str] = None   # rPr@baseline, e.g. "-25000" = subscript
+    underline: Optional[str] = None  # rPr@u, e.g. "sng"
+    sym_font: Optional[str] = None   # <a:sym typeface>: glyphs like U+F0B4 need "Symbol"
 
 
 @dataclass
 class Paragraph:
     runs: list[TextRun] = field(default_factory=list)
     level: int = 0  # indent level for bullets
+    # Resolved through the source's style inheritance (shape -> layout ->
+    # master), so bullets/indents/bold that the source only inherits survive
+    # into a template whose own styles differ.
+    bullet_els: list = field(default_factory=list)  # copied <a:bu*> elements
+    mar_l: Optional[str] = None
+    indent: Optional[str] = None
+    default_bold: Optional[bool] = None  # bold for runs that don't set b
 
     @property
     def full_text(self) -> str:
@@ -143,11 +154,81 @@ def _parse_color(color) -> Optional[str]:
     return None
 
 
-def _parse_text_frame(tf) -> list[Paragraph]:
+_A = f'{{{_DRAWING_NS}}}'
+_P = '{http://schemas.openxmlformats.org/presentationml/2006/main}'
+# One group per pPr bullet slot; each group resolves independently (a slide can
+# set buSzPct while the master supplies buFont + buChar). buBlip is left out:
+# its r:embed points into the source package.
+_BU_GROUPS = (("buClrTx", "buClr"), ("buSzTx", "buSzPct", "buSzPts"),
+              ("buFontTx", "buFont"), ("buNone", "buAutoNum", "buChar"))
+
+
+def _style_chain(shape, slide, lvl):
+    """lvlNpPr elements styling `shape` at `lvl`, most specific first:
+    shape lstStyle -> layout placeholder -> master placeholder -> master txStyles."""
+    tag = f'lvl{lvl + 1}pPr'
+    chain = []
+
+    def add_lst(el):
+        if el is not None:
+            x = el.find(f'.//{_A}lstStyle/{_A}{tag}')
+            if x is not None:
+                chain.append(x)
+
+    add_lst(shape._element)
+    style = 'otherStyle'
+    if shape.is_placeholder:
+        try:
+            base = shape._base_placeholder              # layout placeholder
+            if base is not None:
+                add_lst(base._element)
+                base = base._base_placeholder           # master placeholder
+                if base is not None:
+                    add_lst(base._element)
+        except Exception:
+            pass
+        t = shape.placeholder_format.type
+        style = 'titleStyle' if t is not None and t.name in ("TITLE", "CENTER_TITLE") else 'bodyStyle'
+    try:
+        master = slide.slide_layout.slide_master
+        x = master.element.find(f'{_P}txStyles/{_P}{style}/{_A}{tag}')
+        if x is not None:
+            chain.append(x)
+    except Exception:
+        pass
+    return chain
+
+
+def _resolve_para_style(para, chain, out: Paragraph):
+    pPr = para._p.pPr
+    levels = ([pPr] if pPr is not None else []) + chain
+    for group in _BU_GROUPS:
+        for el in levels:
+            hit = next((c for c in el if c.tag.split('}')[-1] in group), None)
+            if hit is not None:
+                out.bullet_els.append(copy.deepcopy(hit))
+                break
+    for el in levels:
+        if out.mar_l is None and el.get('marL') is not None:
+            out.mar_l = el.get('marL')
+        if out.indent is None and el.get('indent') is not None:
+            out.indent = el.get('indent')
+    for el in chain:  # a paragraph's own pPr/defRPr doesn't style its runs
+        d = el.find(f'{_A}defRPr')
+        if d is not None and d.get('b') is not None:
+            out.default_bold = d.get('b') in ('1', 'true')
+            break
+    if out.default_bold is None and chain:
+        out.default_bold = False   # theme default is regular weight
+
+
+def _parse_text_frame(tf, shape=None, slide=None) -> list[Paragraph]:
     paragraphs = []
     for para in tf.paragraphs:
         runs = []
         for run in para.runs:
+            rPr = run._r.rPr
+            sym = rPr.find(f'{_A}sym') if rPr is not None else None
             tr = TextRun(
                 text=run.text,
                 bold=run.font.bold,
@@ -155,12 +236,21 @@ def _parse_text_frame(tf) -> list[Paragraph]:
                 font_size=run.font.size.pt if run.font.size else None,
                 font_color=_parse_color(run.font.color) if run.font.color else None,
                 font_name=run.font.name,
+                baseline=rPr.get('baseline') if rPr is not None else None,
+                underline=rPr.get('u') if rPr is not None else None,
+                sym_font=sym.get('typeface') if sym is not None else None,
             )
             runs.append(tr)
         if not runs and para.text:
             runs.append(TextRun(text=para.text))
         level = para.level or 0
-        paragraphs.append(Paragraph(runs=runs, level=level))
+        out = Paragraph(runs=runs, level=level)
+        if shape is not None and slide is not None:
+            try:
+                _resolve_para_style(para, _style_chain(shape, slide, level), out)
+            except Exception:
+                pass  # styling is best-effort; the text itself is what matters
+        paragraphs.append(out)
     return paragraphs
 
 
@@ -295,7 +385,7 @@ def parse_source(path: str) -> list[ParsedSlide]:
             elif shape.has_text_frame:
                 ph = shape.placeholder_format if shape.is_placeholder else None
                 tb = TextBox(
-                    paragraphs=_parse_text_frame(shape.text_frame),
+                    paragraphs=_parse_text_frame(shape.text_frame, shape, slide),
                     placeholder_type=ph.type if ph else None,
                     placeholder_idx=ph.idx if ph else None,
                     left=shape.left,

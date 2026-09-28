@@ -1,6 +1,8 @@
 """Core content transfer engine."""
 
 import io
+import copy
+import dataclasses
 import hashlib
 import zipfile
 from collections import defaultdict
@@ -38,7 +40,7 @@ def _dedupe_pptx(path: str):
 
 from parser import ParsedSlide, TextBox, Paragraph, TextRun, ImageData, TableData
 from layout_matcher import TemplateLayout, SlideType, find_best_layout, analyze_template, classify_source_slide
-from layout_safety import plan_fit
+from layout_safety import plan_fit, estimate_content_height
 
 
 # ponytail: hardcoded for CUCOM template whose logo occupies ~0-1.88in in background image
@@ -97,7 +99,7 @@ def _extract_design_images(template_prs):
     stamping its slide-1 photos onto every output slide.
     """
     slides = list(template_prs.slides)
-    if len(slides) < 2:
+    if not slides:
         return []
 
     seen = defaultdict(lambda: {"count": 0, "geom": None, "blob": None})
@@ -138,7 +140,9 @@ def _extract_design_images(template_prs):
                                int(ext.get('cx', 0)), int(ext.get('cy', 0)))
                 rec["blob"] = blob
 
-    threshold = max(2, int(0.6 * len(slides)))
+    # A one-slide template is a design sample (e.g. a logo on a blank page):
+    # its pictures are the decoration. Otherwise require >=2 repeats.
+    threshold = max(min(2, len(slides)), int(0.6 * len(slides)))
     return [(rec["blob"], *rec["geom"])
             for rec in seen.values() if rec["count"] >= threshold]
 
@@ -193,9 +197,10 @@ class TransferResult:
         self.fit_actions: list[str] = []
 
 
-def _apply_run_formatting(dest_run, src_run: TextRun):
-    if src_run.bold is not None:
-        dest_run.font.bold = src_run.bold
+def _apply_run_formatting(dest_run, src_run: TextRun, default_bold=None):
+    bold = src_run.bold if src_run.bold is not None else default_bold
+    if bold is not None:
+        dest_run.font.bold = bold
     if src_run.italic is not None:
         dest_run.font.italic = src_run.italic
     if src_run.font_size is not None:
@@ -210,10 +215,46 @@ def _apply_run_formatting(dest_run, src_run: TextRun):
             dest_run.font.color.rgb = RGBColor(r, g, b)
         except Exception:
             pass
+    rPr = dest_run._r.get_or_add_rPr()
+    if src_run.baseline:
+        rPr.set('baseline', src_run.baseline)
+    if src_run.underline:
+        rPr.set('u', src_run.underline)
+    if src_run.sym_font:
+        # <a:sym> sits after latin/ea/cs; set last so nothing lands behind it.
+        # Without it Symbol-font glyphs (U+F0B4 "x", arrows) render as boxes.
+        sym = rPr.makeelement(f'{{{_NS_A}}}sym', {'typeface': src_run.sym_font})
+        rPr.append(sym)
 
 
-def _write_paragraphs_to_tf(tf, paragraphs: list[Paragraph], clear_first=True):
-    """Write paragraphs into a text frame, preserving runs and formatting."""
+_PPR_TAIL = {f'{{{_NS_A}}}{t}' for t in ('tabLst', 'defRPr', 'extLst')}
+
+
+def _apply_para_style(p, para: Paragraph):
+    """Carry the source's resolved bullet + indent onto a destination paragraph."""
+    if not (para.bullet_els or para.mar_l or para.indent):
+        return
+    pPr = p._p.get_or_add_pPr()
+    if para.mar_l is not None:
+        pPr.set('marL', para.mar_l)
+    if para.indent is not None:
+        pPr.set('indent', para.indent)
+    tail = next((c for c in pPr if c.tag in _PPR_TAIL), None)
+    for el in para.bullet_els:
+        el = copy.deepcopy(el)
+        if tail is not None:
+            tail.addprevious(el)
+        else:
+            pPr.append(el)
+
+
+def _write_paragraphs_to_tf(tf, paragraphs: list[Paragraph], clear_first=True, body=False):
+    """Write paragraphs into a text frame, preserving runs and formatting.
+
+    body=True also carries the source's bullets/indents and its default run
+    weight -- a template whose body style is bold would otherwise bold every
+    run the source left at regular weight, erasing its emphasis. Titles keep
+    the template's own title styling."""
     if clear_first:
         # Clear existing paragraphs except the first (python-pptx requires ≥1)
         tf.clear()
@@ -226,6 +267,9 @@ def _write_paragraphs_to_tf(tf, paragraphs: list[Paragraph], clear_first=True):
             p = tf.add_paragraph()
 
         p.level = para.level
+        if body:
+            _apply_para_style(p, para)
+        default_bold = para.default_bold if body else None
 
         for j, run in enumerate(para.runs):
             if j == 0:
@@ -239,7 +283,7 @@ def _write_paragraphs_to_tf(tf, paragraphs: list[Paragraph], clear_first=True):
             else:
                 r = p.add_run()
                 r.text = run.text
-            _apply_run_formatting(r, run)
+            _apply_run_formatting(r, run, default_bold)
 
         # If no runs, set plain text
         if not para.runs and para.full_text:
@@ -248,6 +292,147 @@ def _write_paragraphs_to_tf(tf, paragraphs: list[Paragraph], clear_first=True):
             else:
                 r = p.add_run()
                 r.text = para.full_text
+
+
+def _inherited_sz_pt(ph):
+    """Font size (pt) the template renders a placeholder's unsized runs at,
+    walking slide -> layout -> master placeholder. None if nothing sets it."""
+    el = ph
+    while el is not None:
+        d = el._element.find(f'.//{{{_NS_A}}}lstStyle/{{{_NS_A}}}lvl1pPr/{{{_NS_A}}}defRPr')
+        if d is not None and d.get('sz'):
+            return int(d.get('sz')) / 100
+        try:
+            el = el._base_placeholder
+        except Exception:
+            el = None
+    return None
+
+
+def _with_default_size(paras, pt):
+    """Copy of paras with unsized runs given the template's size, so the fit
+    estimate measures what will actually render (a 43pt template title is not
+    layout_safety's 18pt default)."""
+    if not pt:
+        return paras
+    return [dataclasses.replace(para, runs=[dataclasses.replace(r, font_size=r.font_size or pt)
+                                             for r in para.runs])
+            for para in paras]
+
+
+def _text_width(width, paras):
+    """Wrap width left after the widest bullet indent (marL)."""
+    indent = max((int(p.mar_l) for p in paras if getattr(p, "mar_l", None)), default=0)
+    return max(width - indent, Inches(1))
+
+
+def _fit_text(ph, paras, min_font_scale=None):
+    """Enable shrink-to-fit on a placeholder and bake layout_safety's plan into
+    normAutofit (PowerPoint only recomputes fontScale on edit). Returns the plan."""
+    tf = ph.text_frame
+    tf.word_wrap = True
+    tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+    kw = {"min_font_scale": min_font_scale} if min_font_scale else {}
+    # overfull_trigger=1.0: plan_fit's default leaves "mildly full" (<=115%)
+    # boxes to PowerPoint's autofit, but PowerPoint only re-runs autofit on
+    # edit, so a delivered deck would render that overflow as-is.
+    default_pt = _inherited_sz_pt(ph)
+    sized = _with_default_size(paras, default_pt)
+    width, height = _text_width(ph.width, paras), ph.height
+    plan = plan_fit(sized, width, height, overfull_trigger=1.0, **kw)
+    if not plan.fits and not min_font_scale:
+        # Clipped text loses content; smaller text doesn't. Go below the 75%
+        # floor rather than spill past the box, but keep the review warning.
+        small = plan_fit(sized, width, height, min_font_scale=0.6, overfull_trigger=1.0)
+        plan = dataclasses.replace(small, warning=plan.warning if not small.fits else
+                                   "body text reduced below 75% to fit -- check readability")
+    # Bake the plan into explicit run sizes / line spacing rather than
+    # normAutofit's fontScale, so every viewer (Google Slides, Keynote, the
+    # PowerPoint web viewer) renders the same fitted size.
+    runs = [r for para in tf.paragraphs for r in para.runs]
+    # Below 90% line spacing, subscripts/superscripts collide with the next
+    # line; take the rest of the height saving from font size instead.
+    spacing = max(0.9, 1.0 - plan.line_spacing_reduction)
+    font_scale = plan.font_scale * (1.0 - plan.line_spacing_reduction) / spacing
+    if font_scale < 1.0:
+        if default_pt or all(r.font.size for r in runs):
+            for r in runs:
+                base = r.font.size.pt if r.font.size else default_pt
+                r.font.size = Pt(max(1.0, round(base * font_scale * 2) / 2))
+        else:
+            na = tf._txBody.find(f'.//{{{_NS_A}}}bodyPr/{{{_NS_A}}}normAutofit')
+            if na is not None:
+                na.set('fontScale', str(int(round(font_scale * 100000))))
+    if spacing < 1.0:
+        for para in tf.paragraphs:
+            para.line_spacing = round(spacing, 2)
+    return plan
+
+
+def _text_rect(ph, plan):
+    """The part of a top-anchored placeholder its text actually uses; images
+    may sit in the empty remainder instead of shrinking to dodge the whole box."""
+    h = ph.height
+    if plan is not None and plan.fits:
+        # ponytail: +20% pad covers what the estimator ignores (bullet indent,
+        # paragraph spacing); measure real line metrics if this still clips.
+        h = min(h, max(int(plan.estimated_height_emu * 1.2), Inches(0.5)))
+    return (ph.left, ph.top, ph.width, h)
+
+
+def _set_rect(ph, left, top, width, height):
+    ph.left, ph.top, ph.width, ph.height = int(left), int(top), int(width), int(height)
+
+
+def _split_for_image(ph, img, src_boxes, paras):
+    """Share one body placeholder between its text and a single source image,
+    keeping the image on the side of the text it occupied in the source
+    (beside it, or above/below it). Shrinks `ph` to the text part and returns
+    the image slot (left, top, w, h). Without this the image can only dodge
+    the whole body box, which on a full-width template body means shrinking
+    it to a thumbnail or dropping it onto the text."""
+    L, T, W, H = ph.left, ph.top, ph.width, ph.height
+    gap = Inches(0.15)
+    sl = min(b.left for b in src_boxes)
+    st = min(b.top for b in src_boxes)
+    sw = max(b.left + b.width for b in src_boxes) - sl
+    if sw and img.left >= sl + 0.55 * sw:
+        side = "right"
+    elif sw and img.left + img.width <= sl + 0.45 * sw:
+        side = "left"
+    elif img.top + img.height / 2 < st:
+        side = "above"
+    else:
+        side = "below"
+
+    sized = _with_default_size(paras, _inherited_sz_pt(ph))
+
+    def need(width):
+        # ponytail: 10% pad for what the estimator ignores (paragraph spacing,
+        # font metrics); measure real line metrics if text ever clips here.
+        return int(estimate_content_height(sized, _text_width(width, paras)) * 1.1)
+
+    if side in ("right", "left"):
+        # narrowest text column (>= source proportion) whose text still fits;
+        # capped at 60% so the image stays legible -- the fitter shrinks text.
+        share = min(0.6, max(0.45, sw / (sw + img.width)))
+        while share < 0.6 and need(int(W * share)) > H:
+            share += 0.05
+        tw = int(W * share)
+        iw = W - tw - gap
+        if side == "right":
+            _set_rect(ph, L, T, tw, H)
+            return (L + tw + gap, T, iw, H)
+        _set_rect(ph, L + iw + gap, T, tw, H)
+        return (L, T, iw, H)
+
+    natural = int(img.height * min(1.0, W / img.width)) if img.width else int(H * 0.4)
+    ih = min(natural, int(H * 0.6), max(H - need(W) - gap, int(H * 0.4)))
+    if side == "above":
+        _set_rect(ph, L, T + ih + gap, W, H - ih - gap)
+        return (L, T, W, ih)
+    _set_rect(ph, L, T, W, H - ih - gap)
+    return (L, T + H - ih, W, ih)
 
 
 # --- Image / body-text collision avoidance -------------------------------- #
@@ -300,7 +485,7 @@ def _overlaps_meaningfully(a, b, threshold=_COLLISION_THRESHOLD):
     return _overlap_fraction(a, b) >= threshold
 
 
-def _find_slide_overlaps(dest_slide, slide_w, slide_h, background_shape_ids=()):
+def _find_slide_overlaps(dest_slide, slide_w, slide_h, background_shape_ids=(), text_extents=None):
     """Generic end-of-slide audit: do any two placed elements (title, body,
     floating textbox, image, table) meaningfully overlap?
 
@@ -314,8 +499,10 @@ def _find_slide_overlaps(dest_slide, slide_w, slide_h, background_shape_ids=()):
     background_shape_ids (from _add_background_images) are excluded outright
     -- template decoration is expected to sit behind, and be covered by,
     real content, whatever its size (a small corner logo counts just as much
-    as CUCOM's full-bleed wedge art). Returns a list of short description
-    strings, one per offending pair.
+    as CUCOM's full-bleed wedge art). text_extents maps a body placeholder's
+    shape_id to the part its text actually fills (_text_rect), so an image
+    placed in the empty remainder of the box isn't reported. Returns a list of
+    short description strings, one per offending pair.
     """
     rects = []
     for sh in dest_slide.shapes:
@@ -323,7 +510,7 @@ def _find_slide_overlaps(dest_slide, slide_w, slide_h, background_shape_ids=()):
             continue
         if sh.left is None or sh.top is None or sh.width is None or sh.height is None:
             continue
-        rect = (sh.left, sh.top, sh.width, sh.height)
+        rect = (text_extents or {}).get(sh.shape_id, (sh.left, sh.top, sh.width, sh.height))
         if sh.has_text_frame and sh.text_frame.text.strip():
             rects.append(("text", rect))
         elif sh.has_table:
@@ -448,6 +635,10 @@ def _add_image_to_slide(slide, img: ImageData, placeholder=None,
     src_w, src_h = img.width, img.height
     if src_w > 0 and src_h > 0:
         ratio = min(width / src_w, height / src_h)
+        if placeholder is not None:
+            # center within the slot rather than pinning to its top-left
+            left += (width - int(src_w * ratio)) // 2
+            top += (height - int(src_h * ratio)) // 2
         width = int(src_w * ratio)
         height = int(src_h * ratio)
 
@@ -586,6 +777,9 @@ def transfer(
                 title_ph.width = max(orig_right - _TITLE_MIN_LEFT, Inches(4))
             try:
                 _write_paragraphs_to_tf(title_ph.text_frame, parsed.title.paragraphs)
+                # Template title boxes are sized for one short line; a long or
+                # two-line source title would otherwise spill over the content.
+                _fit_text(title_ph, parsed.title.paragraphs, min_font_scale=0.5)
                 protected_rects.append((title_ph.left, title_ph.top, title_ph.width, title_ph.height))
             except Exception as e:
                 result.errors.append(f"Title transfer failed: {e}")
@@ -617,6 +811,8 @@ def transfer(
         ]
         body_phs = [ph for _, ph in body_ph_items]
         claimed_ph_indices = set()
+        image_slots = {}  # image index -> (l, t, w, h) reserved by _split_for_image
+        text_extents = {}  # body shape_id -> rect its text fills (see _text_rect)
 
         def _merge_boxes(boxes):
             from parser import Paragraph as Para, TextRun as TR
@@ -625,6 +821,13 @@ def transfer(
                 if i > 0:
                     merged.append(Para(runs=[TR(text="")]))
                 merged.extend(box.paragraphs)
+            if parsed.images:
+                # Runs of blank paragraphs are spacers the source left for an
+                # image to sit in; the image gets its own slot here, so keep
+                # one blank line -- otherwise they eat the fit budget and the
+                # text is shrunk to make room for nothing (Ch.04 slide 24).
+                merged = [q for k, q in enumerate(merged)
+                          if q.full_text.strip() or k == 0 or merged[k - 1].full_text.strip()]
             return merged
 
         def _fill_body(ph, paras):
@@ -635,21 +838,12 @@ def transfer(
             (floored at 75% of the intended size). If content still overflows
             after that, a per-slide warning is recorded and the best-effort
             floor is baked into normAutofit so the deck still renders."""
-            _write_paragraphs_to_tf(ph.text_frame, paras)
-            tf = ph.text_frame
+            _write_paragraphs_to_tf(ph.text_frame, paras, body=True)
             try:
-                tf.word_wrap = True
-                tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+                plan = _fit_text(ph, paras)
             except Exception:
                 return None
-
-            plan = plan_fit(paras, ph.width, ph.height)
             result.fit_actions.append(plan.action)
-            if plan.font_scale < 1.0 or plan.line_spacing_reduction > 0.0:
-                na = tf._txBody.find(f'.//{{{_NS_A}}}bodyPr/{{{_NS_A}}}normAutofit')
-                if na is not None:
-                    na.set('fontScale', str(int(round(plan.font_scale * 100000))))
-                    na.set('lnSpcReduction', str(int(round(plan.line_spacing_reduction * 100000))))
             if plan.warning:
                 result.overflow = True
                 result.warnings.append(f"⚠ Slide {parsed.index + 1} — {plan.warning}.")
@@ -676,10 +870,11 @@ def transfer(
                     left, right = body_text_boxes[:mid], body_text_boxes[mid:]
                     # Each column is fitted independently against its own
                     # (post-split, post-BUG-2-clamp) dimensions.
-                    _fill_body(col1, _merge_boxes(left))
-                    _fill_body(col2, _merge_boxes(right))
-                    protected_rects.append((col1.left, col1.top, col1.width, col1.height))
-                    protected_rects.append((col2.left, col2.top, col2.width, col2.height))
+                    plan1 = _fill_body(col1, _merge_boxes(left))
+                    plan2 = _fill_body(col2, _merge_boxes(right))
+                    for col, plan in ((col1, plan1), (col2, plan2)):
+                        text_extents[col.shape_id] = _text_rect(col, plan)
+                        protected_rects.append(text_extents[col.shape_id])
                 else:
                     col1 = body_phs[0]
                     claimed_ph_indices.add(body_ph_items[0][0])
@@ -688,8 +883,22 @@ def transfer(
                     if wedge_template and col1.left + col1.width > _BODY_SAFE_RIGHT:
                         _place_ph(col1, col1.left, _BODY_SAFE_RIGHT - col1.left)
 
-                    _fill_body(col1, _merge_boxes(body_text_boxes))
-                    protected_rects.append((col1.left, col1.top, col1.width, col1.height))
+                    paras = _merge_boxes(body_text_boxes)
+                    # One free-floating image and no picture slot left for it:
+                    # carve its space out of the body box before fitting text.
+                    spare_media = any(
+                        idx not in claimed_ph_indices
+                        and str(ph.placeholder_format.type) in _MEDIA_PH_TYPES
+                        for idx, ph in ph_map.items())
+                    # Not on wedge templates: their text column is already
+                    # squeezed clear of the wedge, and images sit over the
+                    # wedge area instead (see _BODY_SAFE_RIGHT).
+                    if len(parsed.images) == 1 and not spare_media and not wedge_template:
+                        image_slots[0] = _split_for_image(
+                            col1, parsed.images[0], body_text_boxes, paras)
+                    plan1 = _fill_body(col1, paras)
+                    text_extents[col1.shape_id] = _text_rect(col1, plan1)
+                    protected_rects.append(text_extents[col1.shape_id])
             except Exception as e:
                 result.errors.append(f"Body transfer failed: {e}")
 
@@ -709,7 +918,7 @@ def transfer(
                         from parser import Paragraph as Para, TextRun as TR
                         all_paras.append(Para(runs=[TR(text="")]))
                     all_paras.extend(box.paragraphs)
-                _write_paragraphs_to_tf(txBox.text_frame, all_paras)
+                _write_paragraphs_to_tf(txBox.text_frame, all_paras, body=True)
                 protected_rects.append((txBox.left, txBox.top, txBox.width, txBox.height))
             except Exception as e:
                 result.errors.append(f"Body fallback failed: {e}")
@@ -719,12 +928,19 @@ def transfer(
         # so a second image on the same slide doesn't land on the first one
         # (still just bounding-box avoidance — no packing engine).
         placed_image_rects = []
+        # A small template decoration (corner logo) must stay visible too; a
+        # full-bleed background is meant to be covered, so it's not an obstacle.
+        deco_rects = [(x, y, cx, cy) for _b, x, y, cx, cy in design_images
+                      if not (cx >= dest_prs.slide_width * 0.9 and cy >= dest_prs.slide_height * 0.9)]
         used_media_ph_indices = set(claimed_ph_indices)  # don't double-book a placeholder already filled with text
-        for img in parsed.images:
+        for img_i, img in enumerate(parsed.images):
             try:
                 # Look for an unclaimed picture/media/object placeholder.
                 img_ph = None
-                for idx, ph in ph_map.items():
+                if img_i in image_slots:
+                    l, t, w, h = image_slots[img_i]
+                    img_ph = type("Slot", (), {"left": l, "top": t, "width": w, "height": h})()
+                for idx, ph in ([] if img_ph else ph_map.items()):
                     if idx not in used_media_ph_indices and str(ph.placeholder_format.type) in _MEDIA_PH_TYPES:
                         img_ph = ph
                         used_media_ph_indices.add(idx)
@@ -732,7 +948,7 @@ def transfer(
                 left, top, width, height, still_colliding = _add_image_to_slide(
                     dest_slide, img, placeholder=img_ph,
                     slide_w=dest_prs.slide_width, slide_h=dest_prs.slide_height,
-                    protected_rects=protected_rects + placed_image_rects)
+                    protected_rects=protected_rects + placed_image_rects + deco_rects)
                 placed_image_rects.append((left, top, width, height))
                 if still_colliding:
                     result.warnings.append(
@@ -799,9 +1015,15 @@ def transfer(
                     f"other grouped elements were not transferred ({', '.join(partial)})."
                 )
 
+        # Layout placeholders nothing was written into would show up as
+        # "Click to add text" boxes in the delivered deck.
+        for ph in list(dest_slide.placeholders):
+            if ph.has_text_frame and not ph.text_frame.text.strip():
+                ph._element.getparent().remove(ph._element)
+
         # A slide whose source held only untransferable content would otherwise
         # be an empty page — leave a visible marker instead.
-        if len(dest_slide.shapes) == 0:
+        if not any(sh.shape_id not in background_shape_ids for sh in dest_slide.shapes):
             kinds = ", ".join(sorted({u.label for u in parsed.unsupported_shapes})) \
                 if parsed.unsupported_shapes else "content"
             try:
@@ -815,7 +1037,7 @@ def transfer(
                 pass
 
         overlaps = _find_slide_overlaps(dest_slide, dest_prs.slide_width, dest_prs.slide_height,
-                                         background_shape_ids)
+                                         background_shape_ids, text_extents)
         if overlaps:
             result.warnings.append(
                 f"⚠ Slide {parsed.index + 1} — layout conflict: {overlaps[0]} "

@@ -83,6 +83,11 @@ for sh in slide.shapes:
             object_rect = (sh.left, sh.top, sh.width, sh.height)
     if sh.shape_type == 13:  # PICTURE
         pic_rect = (sh.left, sh.top, sh.width, sh.height)
+# Empty placeholders are stripped from the output, so read the OBJECT slot's
+# frame from the layout the slide was built on.
+for sh in slide.slide_layout.placeholders:
+    if str(sh.placeholder_format.type) == "OBJECT (7)":
+        object_rect = (sh.left, sh.top, sh.width, sh.height)
 
 check("BODY placeholder present and holds text",
       body_rect is not None and slide.placeholders and
@@ -98,9 +103,11 @@ check("OBJECT placeholder was NOT filled with text",
       not any(str(p.placeholder_format.type) == "OBJECT (7)" and p.text_frame.text.strip()
               for p in slide.placeholders if p.has_text_frame))
 check("picture landed inside the OBJECT placeholder's frame, not free-floating",
-      pic_rect is not None and object_rect is not None
-      and abs(pic_rect[0] - object_rect[0]) < Inches(0.05)
-      and abs(pic_rect[1] - object_rect[1]) < Inches(0.05),
+      pic_rect is not None and object_rect is not None  # centered inside the frame
+      and pic_rect[0] >= object_rect[0] - Inches(0.05)
+      and pic_rect[1] >= object_rect[1] - Inches(0.05)
+      and pic_rect[0] + pic_rect[2] <= object_rect[0] + object_rect[2] + Inches(0.05)
+      and pic_rect[1] + pic_rect[3] <= object_rect[1] + object_rect[3] + Inches(0.05),
       (pic_rect, object_rect))
 check("body text does not overlap the picture",
       body_rect is not None and pic_rect is not None

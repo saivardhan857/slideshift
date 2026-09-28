@@ -101,6 +101,7 @@ def plan_fit(
     *,
     min_font_scale: float = MIN_FONT_SCALE,
     margin_in: float = 0.0,
+    overfull_trigger: float = OVERFULL_TRIGGER,
 ) -> LayoutFitPlan:
     """Decide the least-destructive way to fit `paragraphs` into the box."""
     orig_pt = _min_font_pt(paragraphs)
@@ -122,7 +123,7 @@ def plan_fit(
 
     # Step 1 — keep intended formatting. Mildly-full boxes are PowerPoint's job.
     need0 = estimate_content_height(paragraphs, box_w_emu, margin_in=margin_in)
-    if need0 <= avail_h * OVERFULL_TRIGGER:
+    if need0 <= avail_h * overfull_trigger:
         return _plan(True, "none", need0, 1.0, 0.0)
 
     # Step 2 — reduce line spacing within a safe bound.
@@ -140,13 +141,20 @@ def plan_fit(
         paragraphs, box_w_emu,
         line_spacing_reduction=SPACING_REDUCTION_MAX, margin_in=margin_in,
     )
+    # Height isn't linear in font size (smaller type also packs more chars per
+    # line), so a proportional guess can land at ~1.0 for a barely-over box and
+    # fall through to the 75% floor. Step down to the largest size that fits.
     scale = max(min_font_scale, min(1.0, avail_h / max(need_sp, 1)))
-    need_final = estimate_content_height(
-        paragraphs, box_w_emu, font_scale=scale,
-        line_spacing_reduction=SPACING_REDUCTION_MAX, margin_in=margin_in,
-    )
-    if need_final <= avail_h:
-        return _plan(True, "reduce_font", need_final, scale, SPACING_REDUCTION_MAX)
+    while True:
+        need_final = estimate_content_height(
+            paragraphs, box_w_emu, font_scale=scale,
+            line_spacing_reduction=SPACING_REDUCTION_MAX, margin_in=margin_in,
+        )
+        if need_final <= avail_h:
+            return _plan(True, "reduce_font", need_final, scale, SPACING_REDUCTION_MAX)
+        if scale <= min_font_scale:
+            break
+        scale = max(min_font_scale, scale - 0.025)
 
     # Step 4 — unavoidable overflow. Apply the floor as best effort, warn, still ship.
     return _plan(
@@ -188,6 +196,13 @@ def demo():
     med = estimate_content_height(dense, int(5 * EMU_PER_IN))
     narrow = estimate_content_height(dense, int(3 * EMU_PER_IN))
     assert narrow > med > wide, (narrow, med, wide)
+
+    # Barely over after max spacing cut -> a small font cut, not the 75% floor.
+    rows = [_P([_R("x" * 75, 20)]) for _ in range(12)]
+    h = estimate_content_height(rows, int(9 * EMU_PER_IN),
+                                line_spacing_reduction=SPACING_REDUCTION_MAX)
+    p = plan_fit(rows, int(9 * EMU_PER_IN), h - 1000)
+    assert p.fits and p.font_scale > 0.9, p
 
     print("[OK] layout_safety ladder + width sensitivity")
 
